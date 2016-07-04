@@ -235,17 +235,17 @@ static void ShowTwitchUserIsLiveNotification(HICON icon)
 {
     gLastPopupUserIndex = gOnlineCheckIndex;
 
+    WCHAR title[1024];
+    wsprintfW(title, L"'%s' just went live!", gUsers[gOnlineCheckIndex].name);
+
+    WCHAR message[1024];
+
     if (gGameName[0] == 0)
     {
-        WCHAR message[1024];
-        wsprintfW(message, L"'%s' just went live!", gUsers[gOnlineCheckIndex].name);
-        ShowNotification(message, NULL, NIIF_USER, icon);
+        StrCpyNW(message, L"Playing unknown game", _countof(message));
     }
     else
     {
-        WCHAR title[1024];
-        wsprintfW(title, L"'%s' just went live!", gUsers[gOnlineCheckIndex].name);
-
         // change \uXXXX to unicode chars
         WCHAR* write = gGameName;
         WCHAR* read = gGameName;
@@ -276,10 +276,9 @@ static void ShowTwitchUserIsLiveNotification(HICON icon)
         }
         *write++ = 0;
 
-        WCHAR message[1024];
         wsprintfW(message, L"Playing '%s'", gGameName);
-        ShowNotification(message, title, NIIF_USER, icon);
     }
+    ShowNotification(message, title, NIIF_USER, icon);
 }
 
 static void StartImageDownload(char* url, int length)

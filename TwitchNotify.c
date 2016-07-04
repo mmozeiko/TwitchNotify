@@ -1,5 +1,6 @@
 #pragma warning (push, 0)
 #include <windows.h>
+#include <shlobj.h>
 #include <wininet.h>
 #include <strsafe.h>
 #pragma warning (pop)
@@ -33,7 +34,7 @@
 #define MAX_NAMELEN 256
 
 #define DEFAULT_INTERVAL_SECONDS 60
-#define LIVE_CHECK_TIMER_ID 1
+#define ONLINE_CHECK_TIMER_ID 1
 #define RELOAD_CONFIG_TIMER_ID 2
 
 struct User
@@ -46,6 +47,7 @@ static int gUserCount;
 
 static int gReloadingConfig;
 
+static int gUseLivestreamer;
 static int gActive;
 static int gLastPopupUserIndex = -1;
 
@@ -59,7 +61,7 @@ static int gInternetDataLength;
 static HINTERNET gInternet;
 static HINTERNET gConnection;
 
-static int gLiveCheckIndex = -1;
+static int gOnlineCheckIndex = -1;
 
 #pragma function ("memset")
 void* memset(void* dst, int value, size_t count)
@@ -68,7 +70,7 @@ void* memset(void* dst, int value, size_t count)
     return dst;
 }
 
-static int MemoryIsEqual(void* str1, size_t size1, void* str2, size_t size2)
+static int StringsAreEqual(void* str1, size_t size1, void* str2, size_t size2)
 {
     return size1 == size2 && RtlCompareMemory(str1, str2, size1) == size1;
 }
@@ -169,23 +171,33 @@ static int LoadConfig(WCHAR* folder, int folderLength)
 
 static void OpenTwitchUser(int index)
 {
-    if (index >= 0 && index < gUserCount)
+    if (index < 0 || index >= gUserCount)
     {
-        WCHAR url[300] = L"https://www.twitch.tv/";
-        StringCbCatW(url, _countof(url), gUsers[index].name);
+        return;
+    }
+
+    WCHAR url[300] = L"https://www.twitch.tv/";
+    StringCchCatW(url, _countof(url), gUsers[index].name);
+
+    if (gUseLivestreamer && gUsers[index].online)
+    {
+        ShellExecuteW(NULL, L"open", L"livestreamer.exe", url, NULL, SW_HIDE);
+    }
+    else
+    {
         ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
     }
 }
 
 static int StartNextUserCheck(void)
 {
-    if (gLiveCheckIndex >= gUserCount)
+    if (gOnlineCheckIndex >= gUserCount)
     {
         return 0;
     }
 
     WCHAR url[300] = L"https://api.twitch.tv/kraken/streams/";
-    StringCbCatW(url, _countof(url), gUsers[gLiveCheckIndex].name);
+    StringCchCatW(url, _countof(url), gUsers[gOnlineCheckIndex].name);
 
     InternetOpenUrlW(gInternet, url, NULL, 0,
         INTERNET_FLAG_EXISTING_CONNECT | INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_SECURE, (DWORD_PTR)gInternet);
@@ -233,7 +245,7 @@ static void StartInternetCheck(void)
 {
     if (gConnection == NULL)
     {
-        gLiveCheckIndex = 0;
+        gOnlineCheckIndex = 0;
         StartNextUserCheck();
     }
 }
@@ -245,20 +257,20 @@ static void ParseInternetData(void)
 
     if (StringBeginsWith(gInternetData, gInternetDataLength, offline, _countof(offline) - 1))
     {
-        gUsers[gLiveCheckIndex].online = 0;
+        gUsers[gOnlineCheckIndex].online = 0;
     }
     else if (StringBeginsWith(gInternetData, gInternetDataLength, online, _countof(online) - 1))
     {
-        if (gUsers[gLiveCheckIndex].online == 0)
+        if (gUsers[gOnlineCheckIndex].online == 0)
         {
             // TODO: load and show logo in notification, URL starts with "logo":"
 
             WCHAR message[1024];
-            wsprintfW(message, L"'%s' just went live!", gUsers[gLiveCheckIndex].name);
-            gLastPopupUserIndex = gLiveCheckIndex;
+            wsprintfW(message, L"'%s' just went live!", gUsers[gOnlineCheckIndex].name);
+            gLastPopupUserIndex = gOnlineCheckIndex;
             ShowNotification(message);
 
-            gUsers[gLiveCheckIndex].online = 1;
+            gUsers[gOnlineCheckIndex].online = 1;
         }
     }
 }
@@ -296,25 +308,37 @@ static void ReceiveInternetData(void)
     ParseInternetData();
 
     InternetCloseHandle(gConnection);
-    gLiveCheckIndex++;
+    gOnlineCheckIndex++;
     StartNextUserCheck();
 }
-
 
 static void ToggleActive(HWND window)
 {
     if (gActive)
     {
-        KillTimer(window, LIVE_CHECK_TIMER_ID);
+        KillTimer(window, ONLINE_CHECK_TIMER_ID);
     }
     else
     {
         StartInternetCheck();
 
-        UINT_PTR timer = SetTimer(window, LIVE_CHECK_TIMER_ID, DEFAULT_INTERVAL_SECONDS * 1000, NULL);
+        UINT_PTR timer = SetTimer(window, ONLINE_CHECK_TIMER_ID, DEFAULT_INTERVAL_SECONDS * 1000, NULL);
         Assert(timer);
     }
     gActive = !gActive;
+}
+
+static void FindLivestreamer(void)
+{
+    WCHAR livestreamer[MAX_PATH];
+    if (FindExecutableW(L"livestreamer.exe", NULL, livestreamer) > (HINSTANCE)32)
+    {
+        gUseLivestreamer = 1;
+    }
+    else
+    {
+        gUseLivestreamer = 0;
+    }
 }
 
 static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM lparam)
@@ -363,6 +387,8 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                 HMENU menu = CreatePopupMenu();
                 Assert(menu);
                 AppendMenuW(menu, gActive ? MF_CHECKED : MF_UNCHECKED, 1, L"Active");
+                AppendMenuW(menu, gUseLivestreamer ? MF_CHECKED : MF_UNCHECKED, 2, L"Use livestreamer");
+                AppendMenuW(menu, gUseLivestreamer ? MF_STRING : MF_GRAYED, 3, L"Edit livestreamerrc file");
 
                 if (gUserCount == 0)
                 {
@@ -374,12 +400,12 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                     Assert(users);
                     for (int i = 0; i < gUserCount; i++)
                     {
-                        AppendMenuW(users, (gUsers[i].online ? MF_CHECKED : MF_UNCHECKED), (i + 1) << 8, gUsers[i].name);
+                        AppendMenuW(users, (gUsers[i].online ? MF_CHECKED : MF_UNCHECKED),(i + 1) << 8, gUsers[i].name);
                     }
                     AppendMenuW(menu, MF_POPUP, (UINT_PTR)users, L"Users");
                 }
                 AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-                AppendMenuW(menu, MF_STRING, 2, L"Exit");
+                AppendMenuW(menu, MF_STRING, 255, L"Exit");
 
                 POINT mouse;
                 GetCursorPos(&mouse);
@@ -391,6 +417,41 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                     ToggleActive(window);
                 }
                 else if (cmd == 2)
+                {
+                    gUseLivestreamer = !gUseLivestreamer;
+                    if (gUseLivestreamer)
+                    {
+                        FindLivestreamer();
+                        if (!gUseLivestreamer)
+                        {
+                            MessageBoxW(NULL, L"Cannot find 'livestreamer.exe' in PATH!",
+                                TWITCH_NOTIFY_TITLE, MB_ICONEXCLAMATION);
+                        }
+                    }
+                }
+                else if (cmd == 3)
+                {
+                    WCHAR path[MAX_PATH];
+
+                    HRESULT hr = SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, SHGFP_TYPE_CURRENT, path);
+                    Assert(SUCCEEDED(hr));
+
+                    StringCchCatW(path, _countof(path), L"\\livestreamer");
+
+                    DWORD attrib = GetFileAttributesW(path);
+
+                    if (attrib == INVALID_FILE_ATTRIBUTES
+                        && !CreateDirectoryW(path, NULL))
+                    {
+                        MessageBoxW(NULL, L"Cannot create livestreamer configuration directory!",
+                            TWITCH_NOTIFY_TITLE, MB_ICONERROR);
+                    }
+
+                    StringCchCatW(path, _countof(path), L"\\livestreamerrc");
+
+                    ShellExecuteW(NULL, L"open", L"notepad.exe", path, NULL, SW_SHOWNORMAL);
+                }
+                else if (cmd == 255)
                 {
                     DestroyWindow(window);
                 }
@@ -437,7 +498,7 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
 
         case WM_TIMER:
         {
-            if (wparam == LIVE_CHECK_TIMER_ID)
+            if (wparam == ONLINE_CHECK_TIMER_ID)
             {
                 StartInternetCheck();
             }
@@ -477,7 +538,7 @@ static DWORD ConfigNotifyThread(LPVOID arg)
 
         while ((char*)info + sizeof(*info) <= buffer + read)
         {
-            if (MemoryIsEqual(info->FileName, info->FileNameLength,
+            if (StringsAreEqual(info->FileName, info->FileNameLength,
                 TWITCH_NOTIFY_CONFIG, sizeof(TWITCH_NOTIFY_CONFIG) - sizeof(WCHAR)))
             {
                 if (info->Action == FILE_ACTION_REMOVED)
@@ -502,6 +563,21 @@ static DWORD ConfigNotifyThread(LPVOID arg)
     }
 }
 
+static void FindExeFolder(HMODULE instance)
+{
+    gExeFolderLength = GetModuleFileNameW(instance, gExeFolder, _countof(gExeFolder));
+    while (gExeFolderLength > 0 && gExeFolder[gExeFolderLength] != L'\\')
+    {
+        --gExeFolderLength;
+    }
+    gExeFolder[gExeFolderLength] = 0;
+
+    if (!LoadConfig(gExeFolder, gExeFolderLength))
+    {
+        MessageBoxW(NULL, L"Cannot load '" TWITCH_NOTIFY_CONFIG L"' config file!", TWITCH_NOTIFY_TITLE, MB_ICONERROR);
+    }
+}
+
 void WinMainCRTStartup(void)
 {
     WNDCLASSEXW wc =
@@ -522,17 +598,8 @@ void WinMainCRTStartup(void)
     ATOM atom = RegisterClassExW(&wc);
     Assert(atom);
 
-    gExeFolderLength = GetModuleFileNameW(wc.hInstance, gExeFolder, _countof(gExeFolder));
-    while (gExeFolderLength > 0 && gExeFolder[gExeFolderLength] != L'\\')
-    {
-        --gExeFolderLength;
-    }
-    gExeFolder[gExeFolderLength] = 0;
-
-    if (!LoadConfig(gExeFolder, gExeFolderLength))
-    {
-        MessageBoxW(NULL, L"Cannot load '" TWITCH_NOTIFY_CONFIG L"' config file!", TWITCH_NOTIFY_TITLE, MB_ICONERROR);
-    }
+    FindExeFolder(wc.hInstance);
+    FindLivestreamer();
 
     gInternet = InternetOpenW(L"TwitchNotify", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, INTERNET_FLAG_ASYNC);
     Assert(gInternet);

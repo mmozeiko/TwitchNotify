@@ -10,7 +10,7 @@ Click on baloon notifications to open page for Twitch user in your browser. You 
 
 You can grab latest binary here: [TwitchNotify.exe](https://github.com/mmozeiko/TwitchNotify/releases/download/v1/TwitchNotify.exe)
 
-Don't forget to put [TwitchNotify.txt](https://raw.githubusercontent.com/mmozeiko/TwitchNotify/master/TwitchNotify.txt) next to executable.
+Don't forget to put [TwitchNotify.txt](https://raw.githubusercontent.com/mmozeiko/TwitchNotify/master/TwitchNotify.txt) file next to the executable.
 
 # Building
 

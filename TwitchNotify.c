@@ -1,8 +1,11 @@
+#define INITGUID
+#define COBJMACROS
 #pragma warning (push, 0)
 #include <windows.h>
 #include <shlobj.h>
+#include <shlwapi.h>
 #include <wininet.h>
-#include <strsafe.h>
+#include <wincodec.h>
 #pragma warning (pop)
 
 #pragma warning (disable : 4204 4711 4710)
@@ -53,7 +56,6 @@ static int gLastPopupUserIndex = -1;
 
 static HWND gWindow;
 static WCHAR gExeFolder[MAX_PATH + 1];
-static DWORD gExeFolderLength;
 
 static char gInternetData[1024 * 1024];
 static int gInternetDataLength;
@@ -62,6 +64,12 @@ static HINTERNET gInternet;
 static HINTERNET gConnection;
 
 static int gOnlineCheckIndex = -1;
+static int gDownloadingImage;
+static WCHAR gGameName[128];
+
+static IWICImagingFactory* gWicFactory;
+
+int _fltused;
 
 #pragma function ("memset")
 void* memset(void* dst, int value, size_t count)
@@ -70,27 +78,24 @@ void* memset(void* dst, int value, size_t count)
     return dst;
 }
 
-static int StringsAreEqual(void* str1, size_t size1, void* str2, size_t size2)
-{
-    return size1 == size2 && RtlCompareMemory(str1, str2, size1) == size1;
-}
-
 static int StringBeginsWith(void* mem1, size_t size1, void* mem2, size_t size2)
 {
     return size1 >= size2 && RtlCompareMemory(mem1, mem2, size2) == size2;
 }
 
-static void ShowNotification(LPWSTR message)
+static void ShowNotification(LPWSTR message, LPWSTR title, DWORD flags, HICON icon)
 {
     NOTIFYICONDATAW data =
     {
         .cbSize = sizeof(data),
         .hWnd = gWindow,
         .uFlags = NIF_INFO,
-        .dwInfoFlags = NIIF_INFO,
+        .dwInfoFlags = flags | (icon ? NIIF_LARGE_ICON : 0),
+        .hBalloonIcon = icon,
+
     };
-    StringCchCopyW(data.szInfo, _countof(data.szInfo), message);
-    StringCchCopyW(data.szInfoTitle, _countof(data.szInfoTitle), TWITCH_NOTIFY_TITLE);
+    StrCpyNW(data.szInfo, message, _countof(data.szInfo));
+    StrCpyNW(data.szInfoTitle, title ? title : TWITCH_NOTIFY_TITLE, _countof(data.szInfoTitle));
 
     BOOL ret = Shell_NotifyIconW(NIM_MODIFY, &data);
     Assert(ret);
@@ -133,13 +138,12 @@ static void LoadUsers(char* data, int size)
     }
 }
 
-static int LoadConfig(WCHAR* folder, int folderLength)
+static int LoadConfig(WCHAR* folder)
 {
     int result = 0;
 
     WCHAR config[MAX_PATH];
-    StringCchCopyNW(config, _countof(config), folder, folderLength);
-    StringCchCatW(config, _countof(config), L"\\" TWITCH_NOTIFY_CONFIG);
+    wnsprintfW(config, MAX_PATH, L"%s\\" TWITCH_NOTIFY_CONFIG, folder);
 
     HANDLE file = CreateFileW(config, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
     if (file != INVALID_HANDLE_VALUE)
@@ -176,8 +180,8 @@ static void OpenTwitchUser(int index)
         return;
     }
 
-    WCHAR url[300] = L"https://www.twitch.tv/";
-    StringCchCatW(url, _countof(url), gUsers[index].name);
+    WCHAR url[300];
+    wnsprintfW(url, _countof(url), L"https://www.twitch.tv/%s", gUsers[index].name);
 
     if (gUseLivestreamer && gUsers[index].online)
     {
@@ -191,13 +195,19 @@ static void OpenTwitchUser(int index)
 
 static int StartNextUserCheck(void)
 {
-    if (gOnlineCheckIndex >= gUserCount)
+    if (gConnection != NULL)
+    {
+        gConnection = NULL;
+        InternetCloseHandle(gConnection);
+    }
+    if (++gOnlineCheckIndex >= gUserCount)
     {
         return 0;
     }
+    gDownloadingImage = 0;
 
-    WCHAR url[300] = L"https://api.twitch.tv/kraken/streams/";
-    StringCchCatW(url, _countof(url), gUsers[gOnlineCheckIndex].name);
+    WCHAR url[300];
+    wnsprintfW(url, _countof(url), L"https://api.twitch.tv/kraken/streams/%s", gUsers[gOnlineCheckIndex].name);
 
     WCHAR headers[] = L"Client-ID: q35d4ta5iafud6yhnp8a23cj2etweq6\r\n\r\n";
 
@@ -205,12 +215,89 @@ static int StartNextUserCheck(void)
         INTERNET_FLAG_EXISTING_CONNECT | INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_SECURE, (DWORD_PTR)gInternet);
     if (GetLastError() != ERROR_IO_PENDING)
     {
-        gLastPopupUserIndex = -1;
-        ShowNotification(L"Failed to connect to Twitch!");
+        ShowNotification(L"Failed to connect to Twitch!", NULL, NIIF_ERROR, NULL);
         return 0;
     }
 
     return 1;
+}
+
+static void StartInternetCheck(void)
+{
+    if (gConnection == NULL)
+    {
+        gOnlineCheckIndex = -1;
+        StartNextUserCheck();
+    }
+}
+
+static void ShowTwitchUserIsLiveNotification(HICON icon)
+{
+    gLastPopupUserIndex = gOnlineCheckIndex;
+
+    if (gGameName[0] == 0)
+    {
+        WCHAR message[1024];
+        wsprintfW(message, L"'%s' just went live!", gUsers[gOnlineCheckIndex].name);
+        ShowNotification(message, NULL, NIIF_USER, icon);
+    }
+    else
+    {
+        WCHAR title[1024];
+        wsprintfW(title, L"'%s' just went live!", gUsers[gOnlineCheckIndex].name);
+
+        // change \uXXXX to unicode chars
+        WCHAR* write = gGameName;
+        WCHAR* read = gGameName;
+        while (*read && read - gGameName + 6 < _countof(gGameName))
+        {
+            if (read[0] == '\\' && read[1] == 'u')
+            {
+                int value;
+                WCHAR temp = read[6];
+                read[0] = L'0';
+                read[1] = L'x';
+                read[6] = 0;
+                if (StrToIntExW(read, STIF_SUPPORT_HEX, &value))
+                {
+                    *write++ = (WCHAR)value;
+                }
+                else
+                {
+                    *write++ = L'?';
+                }
+                read[6] = temp;
+                read += 6;
+            }
+            else
+            {
+                *write++ = *read++;
+            }
+        }
+        *write++ = 0;
+
+        WCHAR message[1024];
+        wsprintfW(message, L"Playing '%s'", gGameName);
+        ShowNotification(message, title, NIIF_USER, icon);
+    }
+}
+
+static void StartImageDownload(char* url, int length)
+{
+    gDownloadingImage = 1;
+
+    WCHAR* wurl = _alloca((length + 1) * sizeof(WCHAR));
+    int wlength = MultiByteToWideChar(CP_UTF8, 0, url, length, wurl, length + 1);
+    wurl[wlength] = 0;
+
+    InternetOpenUrlW(gInternet, wurl, NULL, 0,
+        INTERNET_FLAG_EXISTING_CONNECT | INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_SECURE, (DWORD_PTR)gInternet);
+    if (GetLastError() != ERROR_IO_PENDING)
+    {
+        ShowTwitchUserIsLiveNotification(NULL);
+        StartNextUserCheck();
+    }
+
 }
 
 void CALLBACK InternetCallback(HINTERNET internet, DWORD_PTR context, DWORD status, LPVOID info, DWORD length)
@@ -234,7 +321,7 @@ void CALLBACK InternetCallback(HINTERNET internet, DWORD_PTR context, DWORD stat
         }
         else
         {
-            ShowNotification(L"Failed to connect to Twitch!");
+            ShowNotification(L"Failed to connect to Twitch!", NULL, NIIF_ERROR, NULL);
         }
     }
     else if (status == INTERNET_STATUS_HANDLE_CLOSING)
@@ -243,19 +330,108 @@ void CALLBACK InternetCallback(HINTERNET internet, DWORD_PTR context, DWORD stat
     }
 }
 
-static void StartInternetCheck(void)
+static HICON CreateNotificationIcon(void* data, DWORD length)
 {
-    if (gConnection == NULL)
+    if (!gWicFactory)
     {
-        gOnlineCheckIndex = 0;
-        StartNextUserCheck();
+        return NULL;
     }
+
+    IStream* stream = SHCreateMemStream(data, length);
+    if (!stream)
+    {
+        return NULL;
+    }
+
+    HICON icon = NULL;
+    HRESULT hr;
+
+    IWICBitmapDecoder* decoder;
+    hr = IWICImagingFactory_CreateDecoderFromStream(gWicFactory, stream, NULL, WICDecodeMetadataCacheOnDemand,
+        &decoder);
+    if (SUCCEEDED(hr))
+    {
+        IWICBitmapFrameDecode* frame;
+        hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame);
+        if (SUCCEEDED(hr))
+        {
+            IWICFormatConverter* bitmap;
+            hr = IWICImagingFactory_CreateFormatConverter(gWicFactory, &bitmap);
+            if (SUCCEEDED(hr))
+            {
+                hr = IWICFormatConverter_Initialize(bitmap, (IWICBitmapSource*)frame,
+                    &GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, NULL, 0., WICBitmapPaletteTypeCustom);
+                if (SUCCEEDED(hr))
+                {
+                    UINT w, h;
+                    if (SUCCEEDED(IWICBitmapFrameDecode_GetSize(bitmap, &w, &h)))
+                    {
+                        DWORD stride = w * 4;
+                        DWORD size = w * h * 4;
+                        BYTE* pixels = LocalAlloc(LMEM_FIXED, size);
+                        if (pixels)
+                        {
+                            if (SUCCEEDED(IWICBitmapFrameDecode_CopyPixels(bitmap, NULL, stride, size, pixels)))
+                            {
+                                icon = CreateIcon(NULL, w, h, 1, 32, NULL, pixels);
+                            }
+                            LocalFree(pixels);
+                        }
+                    }
+                }
+                IWICFormatConverter_Release(bitmap);
+            }
+            IWICBitmapFrameDecode_Release(frame);
+        }
+        IWICBitmapFrameDecode_Release(decoder);
+    }
+    IStream_Release(stream);
+
+    return icon;
 }
 
-static void ParseInternetData(void)
+static int FindSubstring(char* strStart, char chEnd, char** resultBegin, char** resultEnd)
+{
+    int strStartLength = (int)strlen(strStart);
+    char* start = gInternetData;
+    while (start + strStartLength < gInternetData + gInternetDataLength)
+    {
+        if (StrCmpNA(start, strStart, strStartLength) == 0)
+        {
+            break;
+        }
+        start++;
+    }
+
+    if (start + strStartLength < gInternetData + gInternetDataLength)
+    {
+        start += strStartLength;
+
+        char* end = start;
+        while (end < gInternetData + gInternetDataLength)
+        {
+            if (*end == chEnd)
+            {
+                break;
+            }
+            end++;
+        }
+
+        if (end < gInternetData + gInternetDataLength && *end == chEnd)
+        {
+            *resultBegin = start;
+            *resultEnd = end;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void ParseInternetDataAndNotify(void)
 {
     static char offline[] = "{\"stream\":null,";
     static char online[] = "{\"stream\":{\"_id\":";
+    static char error[] = "{\"error\":\"";
 
     if (StringBeginsWith(gInternetData, gInternetDataLength, offline, _countof(offline) - 1))
     {
@@ -265,16 +441,38 @@ static void ParseInternetData(void)
     {
         if (gUsers[gOnlineCheckIndex].online == 0)
         {
-            // TODO: load and show logo in notification, URL starts with "logo":"
-
-            WCHAR message[1024];
-            wsprintfW(message, L"'%s' just went live!", gUsers[gOnlineCheckIndex].name);
-            gLastPopupUserIndex = gOnlineCheckIndex;
-            ShowNotification(message);
-
             gUsers[gOnlineCheckIndex].online = 1;
+
+            char* gameStart;
+            char* gameEnd;
+            if (FindSubstring(",\"game\":\"", '"', &gameStart, &gameEnd))
+            {
+                int wlength = MultiByteToWideChar(CP_UTF8, 0, gameStart, (int)(gameEnd - gameStart),
+                    gGameName, _countof(gGameName) - 1);
+                gGameName[wlength] = 0;
+            }
+            else
+            {
+                gGameName[0] = 0;
+            }
+
+            char* logoStart;
+            char* logoEnd;
+            if (FindSubstring(",\"logo\":\"", '"', &logoStart, &logoEnd))
+            {
+                StartImageDownload(logoStart, (int)(logoEnd - logoStart));
+                return;
+            }
+
+            ShowTwitchUserIsLiveNotification(NULL);
         }
     }
+    else if (StringBeginsWith(gInternetData, gInternetDataLength, error, _countof(error) - 1))
+    {
+        // user doesn't exist?
+    }
+
+    StartNextUserCheck();
 }
 
 static void ReceiveInternetData(void)
@@ -307,11 +505,21 @@ static void ReceiveInternetData(void)
         }
     }
 
-    ParseInternetData();
+    if (gDownloadingImage)
+    {
+        HICON icon = CreateNotificationIcon(gInternetData, gInternetDataLength);
+        ShowTwitchUserIsLiveNotification(icon);
+        if (icon)
+        {
+            DestroyIcon(icon);
+        }
 
-    InternetCloseHandle(gConnection);
-    gOnlineCheckIndex++;
-    StartNextUserCheck();
+        StartNextUserCheck();
+    }
+    else
+    {
+        ParseInternetDataAndNotify();
+    }
 }
 
 static void ToggleActive(HWND window)
@@ -358,7 +566,7 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                 .hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1)),
             };
             Assert(data.hIcon);
-            StringCchCopyW(data.szTip, _countof(data.szTip), TWITCH_NOTIFY_TITLE);
+            StrCpyNW(data.szTip, TWITCH_NOTIFY_TITLE, _countof(data.szTip));
 
             BOOL ret = Shell_NotifyIconW(NIM_ADD, &data);
             Assert(ret);
@@ -434,22 +642,16 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                 else if (cmd == 3)
                 {
                     WCHAR path[MAX_PATH];
-
                     HRESULT hr = SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, SHGFP_TYPE_CURRENT, path);
                     Assert(SUCCEEDED(hr));
 
-                    StringCchCatW(path, _countof(path), L"\\livestreamer");
-
-                    DWORD attrib = GetFileAttributesW(path);
-
-                    if (attrib == INVALID_FILE_ATTRIBUTES
-                        && !CreateDirectoryW(path, NULL))
+                    PathAppendW(path, L"livestreamer");
+                    if (!PathIsDirectoryW(path) && !CreateDirectoryW(path, NULL))
                     {
                         MessageBoxW(NULL, L"Cannot create livestreamer configuration directory!",
                             TWITCH_NOTIFY_TITLE, MB_ICONERROR);
                     }
-
-                    StringCchCatW(path, _countof(path), L"\\livestreamerrc");
+                    PathAppendW(path, L"livestreamerrc");
 
                     ShellExecuteW(NULL, L"open", L"notepad.exe", path, NULL, SW_SHOWNORMAL);
                 }
@@ -468,7 +670,6 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                 {
                     DestroyMenu(users);
                 }
-                return 0;
             }
             else if (lparam == NIN_BALLOONUSERCLICK)
             {
@@ -477,7 +678,6 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                     OpenTwitchUser(gLastPopupUserIndex);
                     gLastPopupUserIndex = -1;
                 }
-                return 0;
             }
             else if (lparam == NIN_BALLOONTIMEOUT)
             {
@@ -494,7 +694,7 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
 
         case WM_TWITCH_NOTIFY_ALREADY_RUNNING:
         {
-            ShowNotification(TWITCH_NOTIFY_TITLE L" is already running!");
+            ShowNotification(TWITCH_NOTIFY_TITLE L" is already running!", NULL, NIIF_INFO, NULL);
             return 0;
         }
 
@@ -506,7 +706,7 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
             }
             else if (wparam == RELOAD_CONFIG_TIMER_ID)
             {
-                if (LoadConfig(gExeFolder, gExeFolderLength))
+                if (LoadConfig(gExeFolder))
                 {
                     KillTimer(window, RELOAD_CONFIG_TIMER_ID);
                     gReloadingConfig = 0;
@@ -540,12 +740,11 @@ static DWORD ConfigNotifyThread(LPVOID arg)
 
         while ((char*)info + sizeof(*info) <= buffer + read)
         {
-            if (StringsAreEqual(info->FileName, info->FileNameLength,
-                TWITCH_NOTIFY_CONFIG, sizeof(TWITCH_NOTIFY_CONFIG) - sizeof(WCHAR)))
+            if (StrCmpNW(TWITCH_NOTIFY_CONFIG, info->FileName, info->FileNameLength) == 0)
             {
                 if (info->Action == FILE_ACTION_REMOVED)
                 {
-                    ShowNotification(L"Config file '" TWITCH_NOTIFY_CONFIG L"' deleted!");
+                    ShowNotification(L"Config file '" TWITCH_NOTIFY_CONFIG L"' deleted!", NULL, NIIF_WARNING, NULL);
                     gUserCount = 0;
                 }
                 else if (!gReloadingConfig)
@@ -567,17 +766,26 @@ static DWORD ConfigNotifyThread(LPVOID arg)
 
 static void FindExeFolder(HMODULE instance)
 {
-    gExeFolderLength = GetModuleFileNameW(instance, gExeFolder, _countof(gExeFolder));
-    while (gExeFolderLength > 0 && gExeFolder[gExeFolderLength] != L'\\')
+    DWORD length = GetModuleFileNameW(instance, gExeFolder, _countof(gExeFolder));
+    while (length > 0 && gExeFolder[length] != L'\\')
     {
-        --gExeFolderLength;
+        --length;
     }
-    gExeFolder[gExeFolderLength] = 0;
+    gExeFolder[length] = 0;
 
-    if (!LoadConfig(gExeFolder, gExeFolderLength))
+    if (!LoadConfig(gExeFolder))
     {
         MessageBoxW(NULL, L"Cannot load '" TWITCH_NOTIFY_CONFIG L"' config file!", TWITCH_NOTIFY_TITLE, MB_ICONERROR);
     }
+}
+
+static void SetupWIC(void)
+{
+    HRESULT hr = CoInitializeEx(NULL, 0);
+    Assert(SUCCEEDED(hr));
+
+    hr = CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, &gWicFactory);
+    Assert(SUCCEEDED(hr));
 }
 
 void WinMainCRTStartup(void)
@@ -599,6 +807,8 @@ void WinMainCRTStartup(void)
 
     ATOM atom = RegisterClassExW(&wc);
     Assert(atom);
+
+    SetupWIC();
 
     FindExeFolder(wc.hInstance);
     FindLivestreamer();

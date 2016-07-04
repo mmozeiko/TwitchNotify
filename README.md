@@ -2,6 +2,8 @@
 
 Simple Windows utility that sits in system tray and notifies you when Twitch users go live.
 
+![screenshot](https://raw.githubusercontent.com/wiki/mmozeiko/TwitchNotify/screenshot.png)
+
 To add/change monitored Twitch users edit the `TwitchNotify.txt` file next to `TwitchNotify.exe` executable. Put each username in separate line. You don't need to restart application after editing file, it will reload `TwitchNotify.txt` file automatically.
 
 Click on baloon notifications to open stream for Twitch user. You can access all monitored users with right click on icon, it will show checkbox next to users that are currently live.
@@ -17,7 +19,7 @@ Change `mpv` to whatever player you use. Read [livestremer documentation](http:/
 
 # Download
 
-You can grab latest binary here: [TwitchNotify.exe](https://github.com/mmozeiko/TwitchNotify/releases/download/v1/TwitchNotify.exe)
+You can grab latest binary here: [TwitchNotify.exe](https://raw.githubusercontent.com/wiki/mmozeiko/TwitchNotify/TwitchNotify.exe)
 
 Don't forget to put [TwitchNotify.txt](https://raw.githubusercontent.com/mmozeiko/TwitchNotify/master/TwitchNotify.txt) file next to the executable.
 

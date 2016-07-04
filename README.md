@@ -19,9 +19,7 @@ Change `mpv` to whatever player you use. Read [livestremer documentation](http:/
 
 # Download
 
-You can grab latest binary here: [TwitchNotify.exe](https://raw.githubusercontent.com/wiki/mmozeiko/TwitchNotify/TwitchNotify.exe)
-
-Don't forget to put [TwitchNotify.txt](https://raw.githubusercontent.com/mmozeiko/TwitchNotify/master/TwitchNotify.txt) file next to the executable.
+You can get newest release as zip archive here: [TwitchNotify.zip](https://raw.githubusercontent.com/wiki/mmozeiko/TwitchNotify/TwitchNotify.zip)
 
 # Building
 

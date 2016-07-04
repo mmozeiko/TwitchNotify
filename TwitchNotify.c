@@ -199,7 +199,9 @@ static int StartNextUserCheck(void)
     WCHAR url[300] = L"https://api.twitch.tv/kraken/streams/";
     StringCchCatW(url, _countof(url), gUsers[gOnlineCheckIndex].name);
 
-    InternetOpenUrlW(gInternet, url, NULL, 0,
+    WCHAR headers[] = L"Client-ID: q35d4ta5iafud6yhnp8a23cj2etweq6\r\n\r\n";
+
+    InternetOpenUrlW(gInternet, url, headers, _countof(headers) - 1,
         INTERNET_FLAG_EXISTING_CONNECT | INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_SECURE, (DWORD_PTR)gInternet);
     if (GetLastError() != ERROR_IO_PENDING)
     {

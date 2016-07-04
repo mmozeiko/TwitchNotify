@@ -13,7 +13,7 @@ To use [livestreamer](http://livestreamer.io/) you need to set up default qualit
     player=mpv
     default-stream=best 
 
-Change mpv to whatever player you use. Read [livestremer documentation](http://docs.livestreamer.io/cli.html#cli-options) about what other options you can put there. You can easily open notepad with this file from popup menu on tray icon.
+Change `mpv` to whatever player you use. Read [livestremer documentation](http://docs.livestreamer.io/cli.html#cli-options) about what other options you can put there. You can easily open notepad with this file from popup menu on tray icon.
 
 # Download
 

@@ -8,6 +8,10 @@
 #include <wincodec.h>
 #pragma warning (pop)
 
+// TODO
+// check for updates https://api.github.com/repos/mmozeiko/TwitchNotify/commits/master
+// parsing json with proper parser http://zserge.com/jsmn.html
+
 #pragma warning (disable : 4204 4711 4710)
 
 #ifdef _DEBUG
@@ -30,15 +34,24 @@
 #define WM_TWITCH_NOTIFY_INTERNET_DATA   (WM_USER + 2)
 #define WM_TWITCH_NOTIFY_ALREADY_RUNNING (WM_USER + 3)
 
+#define CMD_OPEN_HOMEPAGE       1
+#define CMD_TOGGLE_ACTIVE       2
+#define CMD_USE_LIVESTREAMER    3
+#define CMD_EDIT_LIVESTREAMERRC 4
+#define CMD_EDIT_CONFIG_FILE    5
+
 #define TWITCH_NOTIFY_CONFIG L"TwitchNotify.txt"
 #define TWITCH_NOTIFY_TITLE L"Twitch Notify"
 
 #define MAX_USERS 128
 #define MAX_NAMELEN 256
+#define MAX_ICON_SIZE 256
 
 #define DEFAULT_INTERVAL_SECONDS 60
 #define ONLINE_CHECK_TIMER_ID 1
 #define RELOAD_CONFIG_TIMER_ID 2
+
+#define MAX_ICON_CACHE_AGE (60*60*24*7) // 1 week
 
 struct User
 {
@@ -65,6 +78,7 @@ static HINTERNET gConnection;
 
 static int gOnlineCheckIndex = -1;
 static int gDownloadingImage;
+static UINT64 gImageHash;
 static WCHAR gGameName[128];
 
 static IWICImagingFactory* gWicFactory;
@@ -236,7 +250,7 @@ static void ShowTwitchUserIsLiveNotification(HICON icon)
     gLastPopupUserIndex = gOnlineCheckIndex;
 
     WCHAR title[1024];
-    wsprintfW(title, L"'%s' just went live!", gUsers[gOnlineCheckIndex].name);
+    wnsprintfW(title, _countof(title), L"'%s' just went live!", gUsers[gOnlineCheckIndex].name);
 
     WCHAR message[1024];
 
@@ -246,11 +260,11 @@ static void ShowTwitchUserIsLiveNotification(HICON icon)
     }
     else
     {
-        // change \uXXXX to unicode chars
         WCHAR* write = gGameName;
         WCHAR* read = gGameName;
         while (*read && read - gGameName + 6 < _countof(gGameName))
         {
+            // convert \uXXXX to unicode char
             if (read[0] == '\\' && read[1] == 'u')
             {
                 int value;
@@ -296,7 +310,6 @@ static void StartImageDownload(char* url, int length)
         ShowTwitchUserIsLiveNotification(NULL);
         StartNextUserCheck();
     }
-
 }
 
 void CALLBACK InternetCallback(HINTERNET internet, DWORD_PTR context, DWORD status, LPVOID info, DWORD length)
@@ -329,7 +342,110 @@ void CALLBACK InternetCallback(HINTERNET internet, DWORD_PTR context, DWORD stat
     }
 }
 
-static HICON CreateNotificationIcon(void* data, DWORD length)
+static int GetCachePath(WCHAR* path, DWORD size, UINT64 hash)
+{
+    DWORD length = GetTempPathW(size, path);
+    if (length)
+    {
+        wnsprintfW(path + length, size - length, L"%016I64x.ico", hash);
+        return 1;
+    }
+    return 0;
+}
+
+static void SaveToCache(UINT64 hash, UINT width, UINT height, BYTE* pixels)
+{
+    WCHAR path[MAX_PATH];
+    if (!GetCachePath(path, _countof(path), hash))
+    {
+        return;
+    }
+
+    DWORD size = width * height * 4;
+
+    struct ICONDIR
+    {
+        WORD idReserved;
+        WORD  idType;
+        WORD idCount;
+    } dir = {
+        .idType = 1,
+        .idCount = 1,
+    };
+
+    struct ICONDIRENTRY
+    {
+        BYTE bWidth;
+        BYTE bHeight;
+        BYTE bColorCount;
+        BYTE bReserved;
+        WORD wPlanes;
+        WORD wBitCount;
+        DWORD dwBytesInRes;
+        DWORD dwImageOffset;
+    } entry = {
+        .bWidth = (BYTE)(width == MAX_ICON_SIZE ? 0 : width),
+        .bHeight = (BYTE)(height == MAX_ICON_SIZE ? 0 : height),
+        .wPlanes = 1,
+        .wBitCount = 32,
+        .dwBytesInRes = sizeof(BITMAPINFOHEADER) + size + size/32,
+        .dwImageOffset = sizeof(dir) + sizeof(entry),
+    };
+
+    BITMAPINFOHEADER bmp =
+    {
+        .biSize = sizeof(bmp),
+        .biWidth = width,
+        .biHeight = 2 * height,
+        .biPlanes = 1,
+        .biBitCount = 32,
+        .biSizeImage = size + size / 32,
+    };
+
+    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file != INVALID_HANDLE_VALUE)
+    {
+        DWORD written;
+        WriteFile(file, &dir, sizeof(dir), &written, NULL);
+        WriteFile(file, &entry, sizeof(entry), &written, NULL);
+        WriteFile(file, &bmp, sizeof(bmp), &written, NULL);
+        WriteFile(file, pixels, size, &written, NULL);
+        SetFilePointer(file, size / 32, NULL, FILE_CURRENT); // and-mask, 1bpp
+        SetEndOfFile(file);
+        CloseHandle(file);
+    }
+}
+
+static HICON LoadFromCache(UINT64 hash)
+{
+    WCHAR path[MAX_PATH];
+    if (!GetCachePath(path, _countof(path), hash))
+    {
+        return NULL;
+    }
+
+    WIN32_FILE_ATTRIBUTE_DATA data;
+    if (GetFileAttributesExW(path, GetFileExInfoStandard, &data))
+    {
+        UINT64 lastWrite = (((UINT64)data.ftLastWriteTime.dwHighDateTime) << 32) +
+            data.ftLastWriteTime.dwLowDateTime;
+
+        FILETIME nowTime;
+        GetSystemTimeAsFileTime(&nowTime);
+
+        UINT64 now = (((UINT64)nowTime.dwHighDateTime) << 32) + nowTime.dwLowDateTime;
+        UINT64 expires = lastWrite + (UINT64)MAX_ICON_CACHE_AGE * 10 * 1000 * 1000;
+        if (expires < now)
+        {
+            return NULL;
+        }
+        return LoadImageW(NULL, path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE);
+    }
+
+    return NULL;
+}
+
+static HICON CreateNotificationIcon(UINT64 hash, void* data, DWORD length)
 {
     if (!gWicFactory)
     {
@@ -365,16 +481,56 @@ static HICON CreateNotificationIcon(void* data, DWORD length)
                     UINT w, h;
                     if (SUCCEEDED(IWICBitmapFrameDecode_GetSize(bitmap, &w, &h)))
                     {
-                        DWORD stride = w * 4;
-                        DWORD size = w * h * 4;
-                        BYTE* pixels = LocalAlloc(LMEM_FIXED, size);
-                        if (pixels)
+                        IWICBitmapSource* source = NULL;
+
+                        if (w > MAX_ICON_SIZE || h > MAX_ICON_SIZE)
                         {
-                            if (SUCCEEDED(IWICBitmapFrameDecode_CopyPixels(bitmap, NULL, stride, size, pixels)))
+                            if (w > MAX_ICON_SIZE)
                             {
-                                icon = CreateIcon(NULL, w, h, 1, 32, NULL, pixels);
+                                h = h * MAX_ICON_SIZE / w;
+                                w = MAX_ICON_SIZE;
                             }
-                            LocalFree(pixels);
+                            if (h > MAX_ICON_SIZE)
+                            {
+                                h = MAX_ICON_SIZE;
+                                w = w * MAX_ICON_SIZE / h;
+                            }
+
+                            IWICBitmapScaler* scaler;
+                            hr = IWICImagingFactory_CreateBitmapScaler(gWicFactory, &scaler);
+                            if (SUCCEEDED(hr))
+                            {
+                                hr = IWICBitmapScaler_Initialize(scaler, (IWICBitmapSource*)bitmap, w, h,
+                                    WICBitmapInterpolationModeCubic);
+                                if (SUCCEEDED(hr))
+                                {
+                                    hr = IWICBitmapScaler_QueryInterface(scaler, &IID_IWICBitmapSource, &source);
+                                }
+                                IWICBitmapScaler_Release(scaler);
+                            }
+                        }
+                        else
+                        {
+                            hr = IWICBitmapScaler_QueryInterface(bitmap, &IID_IWICBitmapSource, &source);
+                        }
+
+                        if (SUCCEEDED(hr))
+                        {
+                            Assert(source);
+
+                            DWORD stride = w * 4;
+                            DWORD size = w * h * 4;
+                            BYTE* pixels = LocalAlloc(LMEM_FIXED, size);
+                            if (pixels)
+                            {
+                                if (SUCCEEDED(IWICBitmapFrameDecode_CopyPixels(source, NULL, stride, size, pixels)))
+                                {
+                                    SaveToCache(hash, w, h, pixels);
+                                    icon = CreateIcon(NULL, w, h, 1, 32, NULL, pixels);
+                                }
+                                LocalFree(pixels);
+                            }
+                            IWICBitmapSource_Release(source);
                         }
                     }
                 }
@@ -426,6 +582,17 @@ static int FindSubstring(char* strStart, char chEnd, char** resultBegin, char** 
     return 0;
 }
 
+static UINT64 GetFnv1Hash(BYTE* bytes, int length)
+{
+    UINT64 hash = 14695981039346656037ULL;
+    for (int i = 0; i < length; i++)
+    {
+        hash *= 1099511628211ULL;
+        hash ^= bytes[i];
+    }
+    return hash;
+}
+
 static void ParseInternetDataAndNotify(void)
 {
     static char offline[] = "{\"stream\":null,";
@@ -459,7 +626,20 @@ static void ParseInternetDataAndNotify(void)
             char* logoEnd;
             if (FindSubstring(",\"logo\":\"", '"', &logoStart, &logoEnd))
             {
-                StartImageDownload(logoStart, (int)(logoEnd - logoStart));
+                int logoBytes = (int)(logoEnd - logoStart);
+                UINT64 hash = GetFnv1Hash((BYTE*)logoStart, logoBytes);
+
+                HICON icon = LoadFromCache(hash);
+                if (icon)
+                {
+                    ShowTwitchUserIsLiveNotification(icon);
+                    StartNextUserCheck();
+                    DestroyIcon(icon);
+                    return;
+                }
+
+                gImageHash = hash;
+                StartImageDownload(logoStart, logoBytes);
                 return;
             }
 
@@ -506,14 +686,13 @@ static void ReceiveInternetData(void)
 
     if (gDownloadingImage)
     {
-        HICON icon = CreateNotificationIcon(gInternetData, gInternetDataLength);
+        HICON icon = CreateNotificationIcon(gImageHash, gInternetData, gInternetDataLength);
         ShowTwitchUserIsLiveNotification(icon);
+        StartNextUserCheck();
         if (icon)
         {
             DestroyIcon(icon);
         }
-
-        StartNextUserCheck();
     }
     else
     {
@@ -595,9 +774,18 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                 HMENU users = NULL;
                 HMENU menu = CreatePopupMenu();
                 Assert(menu);
-                AppendMenuW(menu, gActive ? MF_CHECKED : MF_UNCHECKED, 1, L"Active");
-                AppendMenuW(menu, gUseLivestreamer ? MF_CHECKED : MF_UNCHECKED, 2, L"Use livestreamer");
-                AppendMenuW(menu, gUseLivestreamer ? MF_STRING : MF_GRAYED, 3, L"Edit livestreamerrc file");
+                
+#ifdef TWITCH_NOTIFY_VERSION
+                AppendMenuW(menu, MF_GRAYED, 0, L"Twitch Notify - v" TWITCH_NOTIFY_VERSION);
+#else
+                AppendMenuW(menu, MF_GRAYED, 0, L"Twitch Notify");
+#endif
+                AppendMenuW(menu, MF_STRING, CMD_OPEN_HOMEPAGE, L"Open homepage");
+                AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
+                AppendMenuW(menu, gActive ? MF_CHECKED : MF_UNCHECKED, CMD_TOGGLE_ACTIVE, L"Active");
+                AppendMenuW(menu, gUseLivestreamer ? MF_CHECKED : MF_UNCHECKED, CMD_USE_LIVESTREAMER, L"Use livestreamer");
+                AppendMenuW(menu, gUseLivestreamer ? MF_STRING : MF_GRAYED, CMD_EDIT_LIVESTREAMERRC, L"Edit livestreamerrc file");
+                AppendMenuW(menu, gUseLivestreamer ? MF_STRING : MF_GRAYED, CMD_EDIT_CONFIG_FILE, L"Modify user list");
 
                 if (gUserCount == 0)
                 {
@@ -621,11 +809,15 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
 
                 SetForegroundWindow(window);
                 int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, mouse.x, mouse.y, 0, window, NULL);
-                if (cmd == 1)
+                if (cmd == CMD_OPEN_HOMEPAGE)
+                {
+                    ShellExecuteW(NULL, L"open", L"https://github.com/mmozeiko/TwitchNotify/", NULL, NULL, SW_SHOWNORMAL);
+                }
+                else if (cmd == CMD_TOGGLE_ACTIVE)
                 {
                     ToggleActive(window);
                 }
-                else if (cmd == 2)
+                else if (cmd == CMD_USE_LIVESTREAMER)
                 {
                     gUseLivestreamer = !gUseLivestreamer;
                     if (gUseLivestreamer)
@@ -638,7 +830,7 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                         }
                     }
                 }
-                else if (cmd == 3)
+                else if (cmd == CMD_EDIT_LIVESTREAMERRC)
                 {
                     WCHAR path[MAX_PATH];
                     HRESULT hr = SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, SHGFP_TYPE_CURRENT, path);
@@ -651,6 +843,14 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                             TWITCH_NOTIFY_TITLE, MB_ICONERROR);
                     }
                     PathAppendW(path, L"livestreamerrc");
+
+                    ShellExecuteW(NULL, L"open", L"notepad.exe", path, NULL, SW_SHOWNORMAL);
+                }
+                else if (cmd == 5)
+                {
+                    WCHAR path[MAX_PATH];
+                    StrCpyNW(path, gExeFolder, _countof(path));
+                    PathAppendW(path, TWITCH_NOTIFY_CONFIG);
 
                     ShellExecuteW(NULL, L"open", L"notepad.exe", path, NULL, SW_SHOWNORMAL);
                 }

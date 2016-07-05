@@ -1,4 +1,5 @@
 @echo off
+setlocal enabledelayedexpansion
 
 if not "%VS140COMNTOOLS%" == "" goto vs2015
 if not "%VS120COMNTOOLS%" == "" goto vs2013
@@ -22,9 +23,13 @@ set LINK=%LINK% kernel32.lib user32.lib shell32.lib shlwapi.lib ole32.lib winine
 
 where /q git.exe
 if "%ERRORLEVEL%" equ "0" (
-    for /f "tokens=1" %%v in ('git.exe log --oneline -n 1') do (
-      set CL=%CL% /DTWITCH_NOTIFY_VERSION=\"%%v\"
+    for /f "tokens=1" %%t in ('git.exe rev-list --count master') do (
+        set REV=%%t
     )
+    for /f "tokens=1" %%t in ('git.exe log --oneline -n 1') do (
+        set COMMIT=%%t
+    )
+    set CL=%CL% /DTWITCH_NOTIFY_VERSION=\"r!REV!-!COMMIT!\"
 )
 
 if 1 == 1 (

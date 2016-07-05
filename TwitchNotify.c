@@ -776,11 +776,10 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                 Assert(menu);
                 
 #ifdef TWITCH_NOTIFY_VERSION
-                AppendMenuW(menu, MF_GRAYED, 0, L"Twitch Notify - v" TWITCH_NOTIFY_VERSION);
+                AppendMenuW(menu, MF_STRING, CMD_OPEN_HOMEPAGE, L"Twitch Notify (" TWITCH_NOTIFY_VERSION ")");
 #else
-                AppendMenuW(menu, MF_GRAYED, 0, L"Twitch Notify");
+                AppendMenuW(menu, MF_STRING, CMD_OPEN_HOMEPAGE, L"Twitch Notify");
 #endif
-                AppendMenuW(menu, MF_STRING, CMD_OPEN_HOMEPAGE, L"Open homepage");
                 AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
                 AppendMenuW(menu, gActive ? MF_CHECKED : MF_UNCHECKED, CMD_TOGGLE_ACTIVE, L"Active");
                 AppendMenuW(menu, gUseLivestreamer ? MF_CHECKED : MF_UNCHECKED, CMD_USE_LIVESTREAMER, L"Use livestreamer");

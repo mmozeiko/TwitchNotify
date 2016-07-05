@@ -402,6 +402,18 @@ static void SaveToCache(UINT64 hash, UINT width, UINT height, BYTE* pixels)
         .biSizeImage = size + size / 32,
     };
 
+    for (UINT y = 0; y < height / 2; y++)
+    {
+        DWORD* row0 = (DWORD*)(pixels + y * width * 4);
+        DWORD* row1 = (DWORD*)(pixels + (height - 1 - y) * width * 4);
+        for (UINT x = 0; x < width; x++)
+        {
+            DWORD tmp = *row0;
+            *row0++ = *row1;
+            *row1++ = tmp;
+        }
+    }
+
     HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (file != INVALID_HANDLE_VALUE)
     {
@@ -525,8 +537,8 @@ static HICON CreateNotificationIcon(UINT64 hash, void* data, DWORD length)
                             {
                                 if (SUCCEEDED(IWICBitmapFrameDecode_CopyPixels(source, NULL, stride, size, pixels)))
                                 {
-                                    SaveToCache(hash, w, h, pixels);
                                     icon = CreateIcon(NULL, w, h, 1, 32, NULL, pixels);
+                                    SaveToCache(hash, w, h, pixels);
                                 }
                                 LocalFree(pixels);
                             }
@@ -599,15 +611,17 @@ static void ParseInternetDataAndNotify(void)
     static char online[] = "{\"stream\":{\"_id\":";
     static char error[] = "{\"error\":\"";
 
+    struct User* user = gUsers + gOnlineCheckIndex;
+
     if (StringBeginsWith(gInternetData, gInternetDataLength, offline, _countof(offline) - 1))
     {
-        gUsers[gOnlineCheckIndex].online = 0;
+        user->online = 0;
     }
     else if (StringBeginsWith(gInternetData, gInternetDataLength, online, _countof(online) - 1))
     {
-        if (gUsers[gOnlineCheckIndex].online == 0)
+        if (user->online == 0)
         {
-            gUsers[gOnlineCheckIndex].online = 1;
+            user->online = 1;
 
             char* gameStart;
             char* gameEnd;
@@ -771,10 +785,17 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
         {
             if (lparam == WM_RBUTTONUP)
             {
-                HMENU users = NULL;
+                HMENU users = CreatePopupMenu();
+                Assert(users);
+
+                for (int i = 0; i < gUserCount; i++)
+                {
+                    AppendMenuW(users, gUsers[i].online ? MF_CHECKED : MF_STRING, (i + 1) << 8, gUsers[i].name);
+                }
+
                 HMENU menu = CreatePopupMenu();
                 Assert(menu);
-                
+
 #ifdef TWITCH_NOTIFY_VERSION
                 AppendMenuW(menu, MF_STRING, CMD_OPEN_HOMEPAGE, L"Twitch Notify (" TWITCH_NOTIFY_VERSION ")");
 #else
@@ -792,14 +813,9 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                 }
                 else
                 {
-                    users = CreatePopupMenu();
-                    Assert(users);
-                    for (int i = 0; i < gUserCount; i++)
-                    {
-                        AppendMenuW(users, (gUsers[i].online ? MF_CHECKED : MF_UNCHECKED),(i + 1) << 8, gUsers[i].name);
-                    }
                     AppendMenuW(menu, MF_POPUP, (UINT_PTR)users, L"Users");
                 }
+
                 AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
                 AppendMenuW(menu, MF_STRING, 255, L"Exit");
 
@@ -864,10 +880,7 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                 }
 
                 DestroyMenu(menu);
-                if (users)
-                {
-                    DestroyMenu(users);
-                }
+                DestroyMenu(users);
             }
             else if (lparam == NIN_BALLOONUSERCLICK)
             {

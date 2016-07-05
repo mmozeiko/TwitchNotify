@@ -21,24 +21,23 @@ set CL=/nologo /errorReport:none /Wall /WX /GS- /Gm- /GR- /fp:fast /EHa-
 set LINK=/errorReport:none /INCREMENTAL:NO /NODEFAULTLIB /SUBSYSTEM:WINDOWS
 set LINK=%LINK% kernel32.lib user32.lib shell32.lib shlwapi.lib ole32.lib wininet.lib windowscodecs.lib
 
-where /q git.exe
-if "%ERRORLEVEL%" equ "0" (
-    for /f "tokens=1" %%t in ('git.exe rev-list --count master') do (
-        set REV=%%t
-    )
-    for /f "tokens=1" %%t in ('git.exe log --oneline -n 1') do (
-        set COMMIT=%%t
-    )
-    set CL=%CL% /DTWITCH_NOTIFY_VERSION=\"r!REV!-!COMMIT!\"
-)
-
 if 1 == 1 (
     rem release
-    set CL=%CL% /Ox /GF /Gy
+    where /q git.exe
+    if "%ERRORLEVEL%" equ "0" (
+        for /f "tokens=1" %%t in ('git.exe rev-list --count master') do (
+            set REV=%%t
+        )
+        for /f "tokens=1" %%t in ('git.exe log --oneline -n 1') do (
+            set COMMIT=%%t
+        )
+        set CL=%CL% /DTWITCH_NOTIFY_VERSION=\"r!REV!-!COMMIT!\"
+    )
+    set CL=!CL! /Ox /GF /Gy
     set LINK=%LINK% /OPT:REF /OPT:ICF
 ) else (
     rem debug
-    set CL=%CL% /Oi /Zi /D_DEBUG
+    set CL=!CL! /Oi /Zi /D_DEBUG
     set LINK=%LINK% /DEBUG
 )
 

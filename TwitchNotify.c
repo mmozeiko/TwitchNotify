@@ -158,15 +158,15 @@ static void OpenTwitchUser(int index)
     }
 }
 
-static void ToggleActive(void)
+static void ToggleActive(HWND window)
 {
     if (gActive)
     {
-        KillTimer(gWindow, UPDATE_USERS_TIMER_ID);
+        KillTimer(window, UPDATE_USERS_TIMER_ID);
     }
     else
     {
-        UINT_PTR timer = SetTimer(gWindow, UPDATE_USERS_TIMER_ID, CHECK_USERS_TIMER_INTERVAL * 1000, NULL);
+        UINT_PTR timer = SetTimer(window, UPDATE_USERS_TIMER_ID, CHECK_USERS_TIMER_INTERVAL * 1000, NULL);
         Assert(timer);
     }
     gActive = !gActive;
@@ -239,7 +239,7 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
             BOOL ret = Shell_NotifyIconW(NIM_ADD, &data);
             Assert(ret);
 
-            ToggleActive();
+            ToggleActive(window);
             SetEvent(gConfigEvent);
             return 0;
         }
@@ -282,7 +282,7 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                 AppendMenuW(menu, gActive ? MF_CHECKED : MF_UNCHECKED, CMD_TOGGLE_ACTIVE, L"Active");
                 AppendMenuW(menu, gUseLivestreamer ? MF_CHECKED : MF_UNCHECKED, CMD_USE_LIVESTREAMER, L"Use livestreamer");
                 AppendMenuW(menu, gUseLivestreamer ? MF_STRING : MF_GRAYED, CMD_EDIT_LIVESTREAMERRC, L"Edit livestreamerrc file");
-                AppendMenuW(menu, gUseLivestreamer ? MF_STRING : MF_GRAYED, CMD_EDIT_CONFIG_FILE, L"Modify user list");
+                AppendMenuW(menu, MF_STRING, CMD_EDIT_CONFIG_FILE, L"Modify user list");
 
                 if (gUserCount == 0)
                 {
@@ -307,7 +307,7 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                     ShellExecuteW(NULL, L"open", L"https://github.com/mmozeiko/TwitchNotify/", NULL, NULL, SW_SHOWNORMAL);
                     break;
                 case CMD_TOGGLE_ACTIVE:
-                    ToggleActive();
+                    ToggleActive(window);
                     break;
                 case CMD_USE_LIVESTREAMER:
                     ToggleLivestreamer();
@@ -870,12 +870,14 @@ static void LoadUsers(char* data, int size)
 
         char* name = data + begin;
         int nameLength = end - begin;
+        if (nameLength)
+        {
+            WCHAR wname[MAX_USER_NAME_LENGTH];
+            int wlength = MultiByteToWideChar(CP_UTF8, 0, name, nameLength, wname, _countof(wname));
+            wname[wlength] = 0;
 
-        WCHAR wname[MAX_USER_NAME_LENGTH];
-        int wlength = MultiByteToWideChar(CP_UTF8, 0, name, nameLength, wname, _countof(wname));
-        wname[wlength] = 0;
-
-        SendMessageW(gWindow, WM_TWITCH_NOTIFY_ADD_USER, (WPARAM)wname, 0);
+            SendMessageW(gWindow, WM_TWITCH_NOTIFY_ADD_USER, (WPARAM)wname, 0);
+        }
 
         if (end + 1 < size && data[end] == '\r' && data[end + 1] == '\n')
         {

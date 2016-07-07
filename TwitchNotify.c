@@ -91,6 +91,8 @@ static WCHAR gExeFolder[MAX_PATH + 1];
 static char gDownloadData[1024 * 1024];
 static DWORD gDownloadLength;
 
+static UINT WM_TASKBARCREATED;
+
 int _fltused;
 
 #pragma function ("memset")
@@ -224,26 +226,33 @@ static void EditConfigFile(void)
     ShellExecuteW(NULL, L"open", L"notepad.exe", path, NULL, SW_SHOWNORMAL);
 }
 
+static void AddTrayIcon(HWND window)
+{
+    NOTIFYICONDATAW data =
+    {
+        .cbSize = sizeof(data),
+        .hWnd = window,
+        .uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP,
+        .uCallbackMessage = WM_TWITCH_NOTIFY_COMMAND,
+        .hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1)),
+    };
+    Assert(data.hIcon);
+    StrCpyNW(data.szTip, TWITCH_NOTIFY_TITLE, _countof(data.szTip));
+
+    BOOL ret = Shell_NotifyIconW(NIM_ADD, &data);
+    Assert(ret);
+}
+
 static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     switch (msg)
     {
         case WM_CREATE:
         {
-            NOTIFYICONDATAW data =
-            {
-                .cbSize = sizeof(data),
-                .hWnd = window,
-                .uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP,
-                .uCallbackMessage = WM_TWITCH_NOTIFY_COMMAND,
-                .hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1)),
-            };
-            Assert(data.hIcon);
-            StrCpyNW(data.szTip, TWITCH_NOTIFY_TITLE, _countof(data.szTip));
+            WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
+            Assert(WM_TASKBARCREATED);
 
-            BOOL ret = Shell_NotifyIconW(NIM_ADD, &data);
-            Assert(ret);
-
+            AddTrayIcon(window);
             ToggleActive(window);
             SetEvent(gConfigEvent);
             return 0;
@@ -426,6 +435,14 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
             }
             return 0;
         }
+
+        default:
+            if (WM_TASKBARCREATED && msg == WM_TASKBARCREATED)
+            {
+                AddTrayIcon(window);
+                return 0;
+            }
+            break;
     }
 
     return DefWindowProcW(window, msg, wparam, lparam);

@@ -67,7 +67,7 @@ struct User
 
 struct UserStatusChange
 {
-    WCHAR gameName[MAX_GAME_NAME_LENGTH];
+    WCHAR game[MAX_GAME_NAME_LENGTH];
     HICON icon;
     int online;
 };
@@ -127,13 +127,13 @@ static void ShowUserOnlineNotification(int index, struct UserStatusChange* statu
 
     WCHAR message[1024];
 
-    if (status->gameName[0] == 0)
+    if (status->game[0] == 0)
     {
         StrCpyNW(message, L"Playing unknown game", _countof(message));
     }
     else
     {
-        wsprintfW(message, L"Playing '%s'", status->gameName);
+        wsprintfW(message, L"Playing '%s'", status->game);
     }
 
     gLastPopupUserIndex = index;
@@ -369,7 +369,6 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
 
         case WM_TWITCH_NOTIFY_REMOVE_USERS:
         {
-            OutputDebugStringA("clearing all users\n");
             gUserCount = 0;
             return 0;
         }
@@ -381,7 +380,6 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                 struct User* user = gUsers + gUserCount++;
                 StrCpyNW(user->name, (PCWSTR)wparam, _countof(user->name));
                 user->online = 0;
-                OutputDebugStringA("adding new user\n");
             }
             return 0;
         }
@@ -398,12 +396,7 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
 
                 if (user->online)
                 {
-                    OutputDebugStringA("user online\n");
                     ShowUserOnlineNotification(index, status);
-                }
-                else
-                {
-                    OutputDebugStringA("user offline\n");
                 }
             }
 
@@ -806,14 +799,14 @@ static int ParseUserData(int index, char* data, size_t dataLength)
             if (FindSubstring(data, dataLength, ",\"game\":\"", '"', &gameStart, &gameEnd))
             {
                 int wlength = MultiByteToWideChar(CP_UTF8, 0, gameStart, (int)(gameEnd - gameStart),
-                    status.gameName, _countof(status.gameName) - 1);
-                status.gameName[wlength] = 0;
+                    status.game, _countof(status.game) - 1);
+                status.game[wlength] = 0;
 
                 // convert \uXXXX to unicode chars
                 {
-                    WCHAR* write = status.gameName;
-                    WCHAR* read = status.gameName;
-                    while (*read && read - status.gameName + 6 < _countof(status.gameName))
+                    WCHAR* write = status.game;
+                    WCHAR* read = status.game;
+                    while (*read && read - status.game + 6 < _countof(status.game))
                     {
                         if (read[0] == '\\' && read[1] == 'u')
                         {
@@ -840,10 +833,6 @@ static int ParseUserData(int index, char* data, size_t dataLength)
                     }
                     *write++ = 0;
                 }
-            }
-            else
-            {
-                status.gameName[0] = 0;
             }
 
             char* logoStart;

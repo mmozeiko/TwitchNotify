@@ -9,7 +9,7 @@
 #pragma warning (pop)
 
 // TODO
-// automatic check for updates https://api.github.com/repos/mmozeiko/TwitchNotify/commits/master
+// automatic check for updates https://api.github.com/repos/mmozeiko/TwitchNotify/git/refs/heads/master
 // parsing json with proper parser http://zserge.com/jsmn.html
 
 #pragma warning (disable : 4204 4711 4710 4820)
@@ -163,11 +163,16 @@ static void ToggleActive(HWND window)
     if (gActive)
     {
         KillTimer(window, UPDATE_USERS_TIMER_ID);
+        for (int i = 0; i < gUserCount; i++)
+        {
+            gUsers[i].online = 0;
+        }
     }
     else
     {
         UINT_PTR timer = SetTimer(window, UPDATE_USERS_TIMER_ID, CHECK_USERS_TIMER_INTERVAL * 1000, NULL);
         Assert(timer);
+        SetEvent(gUpdateEvent);
     }
     gActive = !gActive;
 }
@@ -255,6 +260,19 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
             Assert(ret);
 
             PostQuitMessage(0);
+            return 0;
+        }
+
+        case WM_POWERBROADCAST:
+        {
+            if (wparam == PBT_APMRESUMEAUTOMATIC)
+            {
+                if (gActive)
+                {
+                    ToggleActive(window);
+                    ToggleActive(window);
+                }
+            }
             return 0;
         }
 

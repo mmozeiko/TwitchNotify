@@ -50,6 +50,7 @@
 #define MAX_USER_NAME_LENGTH 256
 #define MAX_GAME_NAME_LENGTH 128
 #define MAX_WINDOWS_ICON_SIZE 256
+#define MAX_DOWNLOAD_SIZE (1024 * 1024) // 1 MiB
 
 #define CHECK_USERS_TIMER_INTERVAL 60 // seconds
 #define RELOAD_CONFIG_TIMER_DELAY 100 // msec
@@ -79,6 +80,7 @@ static int gUseLivestreamer;
 static int gActive;
 static int gLastPopupUserIndex = -1;
 
+static HANDLE gHeap;
 static HWND gWindow;
 static HINTERNET gInternet;
 static IWICImagingFactory* gWicFactory;
@@ -87,9 +89,6 @@ static HANDLE gUpdateEvent;
 static HANDLE gConfigEvent;
 
 static WCHAR gExeFolder[MAX_PATH + 1];
-
-static char gDownloadData[1024 * 1024];
-static DWORD gDownloadLength;
 
 static UINT WM_TASKBARCREATED;
 
@@ -441,10 +440,8 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
     return DefWindowProcW(window, msg, wparam, lparam);
 }
 
-static int DownloadURL(WCHAR* url, WCHAR* headers, DWORD headersLength)
+static int DownloadURL(WCHAR* url, WCHAR* headers, DWORD headersLength, char* data, DWORD* dataLength)
 {
-    gDownloadLength = 0;
-
     HINTERNET connection = InternetOpenUrlW(gInternet, url, headers, headersLength,
         INTERNET_FLAG_EXISTING_CONNECT | INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_SECURE, 0);
     if (!connection)
@@ -452,26 +449,28 @@ static int DownloadURL(WCHAR* url, WCHAR* headers, DWORD headersLength)
         return 0;
     }
 
+    DWORD downloaded = 0;
+    DWORD available = *dataLength;
     int result = 1;
     for (;;)
     {
-        DWORD available = _countof(gDownloadData) - gDownloadLength;
         DWORD read;
-        if (InternetReadFile(connection, gDownloadData + gDownloadLength, available, &read))
+        if (InternetReadFile(connection, data + downloaded, available, &read))
         {
             if (read == 0)
             {
                 break;
             }
-            gDownloadLength += read;
+            downloaded += read;
         }
         else
         {
-            result = 0;
+            result = read == 0;
             break;
         }
     }
     InternetCloseHandle(connection);
+    *dataLength = downloaded;
     return result;
 }
 
@@ -646,18 +645,15 @@ static HICON DecodeIconAndSaveToCache(UINT64 hash, void* data, DWORD length)
                         if (SUCCEEDED(hr))
                         {
                             Assert(source);
+                            Assert(w <= MAX_WINDOWS_ICON_SIZE && h <= MAX_WINDOWS_ICON_SIZE);
 
                             DWORD stride = w * 4;
                             DWORD size = w * h * 4;
-                            BYTE* pixels = LocalAlloc(LMEM_FIXED, size);
-                            if (pixels)
+                            BYTE pixels[MAX_WINDOWS_ICON_SIZE * MAX_WINDOWS_ICON_SIZE * 4];
+                            if (SUCCEEDED(IWICBitmapFrameDecode_CopyPixels(source, NULL, stride, size, pixels)))
                             {
-                                if (SUCCEEDED(IWICBitmapFrameDecode_CopyPixels(source, NULL, stride, size, pixels)))
-                                {
-                                    icon = CreateIcon(NULL, w, h, 1, 32, NULL, pixels);
-                                    SaveIconToCache(hash, w, h, pixels);
-                                }
-                                LocalFree(pixels);
+                                icon = CreateIcon(NULL, w, h, 1, 32, NULL, pixels);
+                                SaveIconToCache(hash, w, h, pixels);
                             }
                             IWICBitmapSource_Release(source);
                         }
@@ -716,12 +712,17 @@ static HICON GetUserIcon(char* url, size_t urlLength)
     int wurlLength = MultiByteToWideChar(CP_UTF8, 0, url, (int)urlLength, wurl, (int)urlLength + 1);
     wurl[wurlLength] = 0;
 
-    if (!DownloadURL(wurl, NULL, 0))
+    DWORD dataLength = MAX_DOWNLOAD_SIZE;
+    char* data = HeapAlloc(gHeap, 0, dataLength);
+    if (data)
     {
-        return NULL;
+        if (DownloadURL(wurl, NULL, 0, data, &dataLength))
+        {
+            icon = DecodeIconAndSaveToCache(hash, data, dataLength);
+        }
+        HeapFree(gHeap, 0, data);
     }
-
-    return DecodeIconAndSaveToCache(hash, gDownloadData, gDownloadLength);
+    return icon;
 }
 
 static int FindSubstring(char* data, size_t dataLength, char* strstart, char chend, char** resultbegin, char** resultend)
@@ -859,6 +860,13 @@ static int ParseUserData(int index, char* data, size_t dataLength)
 
 static int UpdateUsers(void)
 {
+    char* data = HeapAlloc(gHeap, 0, MAX_DOWNLOAD_SIZE);
+    if (!data)
+    {
+        return 0;
+    }
+
+    int result = 1;
     for (int index = 0; index < gUserCount; index++)
     {
         WCHAR url[300];
@@ -866,19 +874,17 @@ static int UpdateUsers(void)
 
         static WCHAR headers[] = L"Client-ID: q35d4ta5iafud6yhnp8a23cj2etweq6\r\n\r\n";
 
-        if (DownloadURL(url, headers, _countof(headers) - 1))
+        DWORD dataLength = MAX_DOWNLOAD_SIZE;
+        if (!DownloadURL(url, headers, _countof(headers) - 1, data, &dataLength) ||
+            !ParseUserData(index, data, dataLength))
         {
-            if (!ParseUserData(index, gDownloadData, gDownloadLength))
-            {
-                return 0;
-            }
-        }
-        else
-        {
-            return 0;
+            result = 0;
+            break;
         }
     }
-    return 1;
+
+    HeapFree(gHeap, 0, data);
+    return result;
 }
 
 static void LoadUsers(char* data, int size)
@@ -1050,6 +1056,9 @@ void WinMainCRTStartup(void)
     {
         gUseLivestreamer = 1;
     }
+
+    gHeap = GetProcessHeap();
+    Assert(gHeap);
 
     gInternet = InternetOpenW(L"TwitchNotify", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
     Assert(gInternet);

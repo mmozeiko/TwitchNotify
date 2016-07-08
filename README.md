@@ -25,6 +25,7 @@ You can get newest release as zip archive here: [TwitchNotify.zip](https://raw.g
 
 * Install [Visual Studio 2015](https://www.visualstudio.com/en-us/products/vs-2015-product-editions.aspx)
 * Run `build.cmd`
+* TwitchNotify uses [jsmn](http://zserge.com/jsmn.html) JSON parsing library (MIT license)
 
 # License
 

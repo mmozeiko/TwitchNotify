@@ -1,18 +1,23 @@
 #define INITGUID
 #define COBJMACROS
+
+#pragma warning (disable : 4204 4711 4710 4820)
 #pragma warning (push, 0)
+
 #include <windows.h>
+#include <strsafe.h>
 #include <shlobj.h>
 #include <shlwapi.h>
 #include <wininet.h>
 #include <wincodec.h>
+
+#include "jsmn.c" // https://github.com/zserge/jsmn
+#include "jsmn_iterator.c" // https://github.com/zserge/jsmn/pull/69
+
 #pragma warning (pop)
 
 // TODO
 // automatic check for updates https://api.github.com/repos/mmozeiko/TwitchNotify/git/refs/heads/master
-// parsing json with proper parser http://zserge.com/jsmn.html
-
-#pragma warning (disable : 4204 4711 4710 4820)
 
 #ifdef _DEBUG
 
@@ -34,7 +39,10 @@
 #define WM_TWITCH_NOTIFY_ALREADY_RUNNING (WM_USER + 2)
 #define WM_TWITCH_NOTIFY_REMOVE_USERS    (WM_USER + 3)
 #define WM_TWITCH_NOTIFY_ADD_USER        (WM_USER + 4)
-#define WM_TWITCH_NOTIFY_UPDATE_USER     (WM_USER + 5)
+#define WM_TWITCH_NOTIFY_START_UPDATE    (WM_USER + 5)
+#define WM_TWITCH_NOTIFY_USER_ONLINE     (WM_USER + 6)
+#define WM_TWITCH_NOTIFY_END_UPDATE      (WM_USER + 7)
+#define WM_TWITCH_NOTIFY_UPDATE_ERROR    (WM_USER + 8)
 
 #define CMD_OPEN_HOMEPAGE       1
 #define CMD_TOGGLE_ACTIVE       2
@@ -46,10 +54,11 @@
 #define TWITCH_NOTIFY_CONFIG L"TwitchNotify.txt"
 #define TWITCH_NOTIFY_TITLE L"Twitch Notify"
 
-#define MAX_USER_COUNT 128
-#define MAX_USER_NAME_LENGTH 256
-#define MAX_GAME_NAME_LENGTH 128
+#define MAX_USER_COUNT        100 // max user count that can be requested in one Twitch API call
+#define MAX_USER_NAME_LENGTH  256
+#define MAX_GAME_NAME_LENGTH  128
 #define MAX_WINDOWS_ICON_SIZE 256
+
 #define MAX_DOWNLOAD_SIZE (1024 * 1024) // 1 MiB
 
 #define CHECK_USERS_TIMER_INTERVAL 60 // seconds
@@ -66,11 +75,11 @@ struct User
     int online;
 };
 
-struct UserStatusChange
+struct UserStatusOnline
 {
+    WCHAR user[MAX_GAME_NAME_LENGTH];
     WCHAR game[MAX_GAME_NAME_LENGTH];
     HICON icon;
-    int online;
 };
 
 static struct User gUsers[MAX_USER_COUNT];
@@ -119,10 +128,10 @@ static void ShowNotification(LPWSTR message, LPWSTR title, DWORD flags, HICON ic
     Assert(ret);
 }
 
-static void ShowUserOnlineNotification(int index, struct UserStatusChange* status)
+static void ShowUserOnlineNotification(struct UserStatusOnline* status)
 {
     WCHAR title[1024];
-    wnsprintfW(title, _countof(title), L"'%s' just went live!", gUsers[index].name);
+    wnsprintfW(title, _countof(title), L"'%s' just went live!", status->user);
 
     WCHAR message[1024];
 
@@ -132,10 +141,9 @@ static void ShowUserOnlineNotification(int index, struct UserStatusChange* statu
     }
     else
     {
-        wsprintfW(message, L"Playing '%s'", status->game);
+        wnsprintfW(message, _countof(message), L"Playing '%s'", status->game);
     }
 
-    gLastPopupUserIndex = index;
     ShowNotification(message, title, NIIF_USER, status->icon);
 }
 
@@ -242,6 +250,11 @@ static void AddTrayIcon(HWND window)
     Assert(ret);
 }
 
+static void OpenHomePage(void)
+{
+    ShellExecuteW(NULL, L"open", L"https://github.com/mmozeiko/TwitchNotify/", NULL, NULL, SW_SHOWNORMAL);
+}
+
 static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM lparam)
 {
     switch (msg)
@@ -330,7 +343,7 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                 switch (cmd)
                 {
                 case CMD_OPEN_HOMEPAGE:
-                    ShellExecuteW(NULL, L"open", L"https://github.com/mmozeiko/TwitchNotify/", NULL, NULL, SW_SHOWNORMAL);
+                    OpenHomePage();
                     break;
                 case CMD_TOGGLE_ACTIVE:
                     ToggleActive(window);
@@ -363,6 +376,10 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                     gLastPopupUserIndex = -1;
                 }
             }
+            else if (lparam == WM_LBUTTONDBLCLK)
+            {
+                OpenHomePage();
+            }
             break;
         }
 
@@ -383,19 +400,31 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
             return 0;
         }
 
-        case WM_TWITCH_NOTIFY_UPDATE_USER:
+        case WM_TWITCH_NOTIFY_START_UPDATE:
         {
-            int index = (int)wparam;
-            struct UserStatusChange* status = (void*)lparam;
-
-            if (index < gUserCount)
+            for (int i = 0; i < gUserCount; i++)
             {
-                struct User* user = gUsers + index;
-                user->online = status->online;
+                gUsers[i].online = -gUsers[i].online;
+            }
+            return 0;
+        }
 
-                if (user->online)
+        case WM_TWITCH_NOTIFY_USER_ONLINE:
+        {
+            struct UserStatusOnline* status = (void*)wparam;
+
+            for (int i = 0; i < gUserCount; i++)
+            {
+                struct User* user = gUsers + i;
+                if (StrCmpW(user->name, status->user) == 0)
                 {
-                    ShowUserOnlineNotification(index, status);
+                    if (user->online == 0)
+                    {
+                        gLastPopupUserIndex = i;
+                        ShowUserOnlineNotification(status);
+                    }
+                    user->online = 1;
+                    break;
                 }
             }
 
@@ -403,7 +432,25 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
             {
                 DestroyIcon(status->icon);
             }
+            return 0;
+        }
 
+        case WM_TWITCH_NOTIFY_END_UPDATE:
+        {
+            for (int i = 0; i < gUserCount; i++)
+            {
+                // -1 means user was online, now is offline
+                //  0 means user was and now is offline
+                // +1 means user now is online
+                gUsers[i].online = gUsers[i].online > 0;
+            }
+            return 0;
+        }
+
+        case WM_TWITCH_NOTIFY_UPDATE_ERROR:
+        {
+            gLastPopupUserIndex = -1;
+            ShowNotification((LPWSTR)wparam, (LPWSTR)lparam, NIIF_ERROR, NULL);
             return 0;
         }
 
@@ -440,9 +487,9 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
     return DefWindowProcW(window, msg, wparam, lparam);
 }
 
-static int DownloadURL(WCHAR* url, WCHAR* headers, DWORD headersLength, char* data, DWORD* dataLength)
+static int DownloadURL(WCHAR* url, WCHAR* headers, char* data, DWORD* dataLength)
 {
-    HINTERNET connection = InternetOpenUrlW(gInternet, url, headers, headersLength,
+    HINTERNET connection = InternetOpenUrlW(gInternet, url, headers, (DWORD)-1,
         INTERNET_FLAG_EXISTING_CONNECT | INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_SECURE, 0);
     if (!connection)
     {
@@ -475,9 +522,8 @@ static int DownloadURL(WCHAR* url, WCHAR* headers, DWORD headersLength, char* da
 }
 
 // http://www.isthe.com/chongo/tech/comp/fnv/
-static UINT64 GetFnv1Hash(void* ptr, size_t size)
+static UINT64 GetFnv1Hash(BYTE* bytes, size_t size)
 {
-    BYTE* bytes = ptr;
     UINT64 hash = 14695981039346656037ULL;
     for (size_t i = 0; i < size; i++)
     {
@@ -699,189 +745,302 @@ static HICON LoadUserIconFromCache(UINT64 hash)
     return NULL;
 }
 
-static HICON GetUserIcon(char* url, size_t urlLength)
+static HICON GetUserIcon(WCHAR* url, int urlLength, char* downloadBuffer)
 {
-    UINT64 hash = GetFnv1Hash(url, urlLength);
+    UINT64 hash = GetFnv1Hash((BYTE*)url, urlLength * sizeof(WCHAR));
     HICON icon = LoadUserIconFromCache(hash);
     if (icon)
     {
         return icon;
     }
 
-    WCHAR* wurl = _alloca((urlLength + 1) * sizeof(WCHAR));
-    int wurlLength = MultiByteToWideChar(CP_UTF8, 0, url, (int)urlLength, wurl, (int)urlLength + 1);
-    wurl[wurlLength] = 0;
-
     DWORD dataLength = MAX_DOWNLOAD_SIZE;
-    char* data = HeapAlloc(gHeap, 0, dataLength);
-    if (data)
+    if (DownloadURL(url, NULL, downloadBuffer, &dataLength))
     {
-        if (DownloadURL(wurl, NULL, 0, data, &dataLength))
-        {
-            icon = DecodeIconAndSaveToCache(hash, data, dataLength);
-        }
-        HeapFree(gHeap, 0, data);
+        icon = DecodeIconAndSaveToCache(hash, downloadBuffer, dataLength);
     }
     return icon;
 }
 
-static int FindSubstring(char* data, size_t dataLength, char* strstart, char chend, char** resultbegin, char** resultend)
+static int jsoneq(const char* json, jsmntok_t* token, const char* str)
 {
-    int strstartLength = (int)strlen(strstart);
-    char* start = data;
-    while (start + strstartLength < data + dataLength)
-    {
-        if (StrCmpNA(start, strstart, strstartLength) == 0)
-        {
-            break;
-        }
-        start++;
-    }
-
-    if (start + strstartLength < data + dataLength)
-    {
-        start += strstartLength;
-
-        char* end = start;
-        while (end < data + dataLength)
-        {
-            if (*end == chend)
-            {
-                break;
-            }
-            end++;
-        }
-
-        if (end < data + dataLength && *end == chend)
-        {
-            *resultbegin = start;
-            *resultend = end;
-            return 1;
-        }
-    }
-    return 0;
-}
-
-static int StringBeginsWith(void* mem1, size_t size1, void* mem2, size_t size2)
-{
-    return size1 >= size2 && RtlCompareMemory(mem1, mem2, size2) == size2;
-}
-
-static int ParseUserData(int index, char* data, size_t dataLength)
-{
-    static char offline[] = "{\"stream\":null,";
-    static char online[] = "{\"stream\":{\"_id\":";
-    static char error[] = "{\"error\":\"";
-
-    const struct User* user = gUsers + index;
-
-    if (StringBeginsWith(data, dataLength, offline, _countof(offline) - 1))
-    {
-        if (user->online == 1)
-        {
-            struct UserStatusChange status =
-            {
-                .online = 0,
-            };
-            SendMessageW(gWindow, WM_TWITCH_NOTIFY_UPDATE_USER, (WPARAM)index, (LPARAM)&status);
-        }
-    }
-    else if (StringBeginsWith(data, dataLength, online, _countof(online) - 1))
-    {
-        if (user->online == 0)
-        {
-            struct UserStatusChange status =
-            {
-                .online = 1,
-            };
-
-            char* gameStart;
-            char* gameEnd;
-            if (FindSubstring(data, dataLength, ",\"game\":\"", '"', &gameStart, &gameEnd))
-            {
-                int wlength = MultiByteToWideChar(CP_UTF8, 0, gameStart, (int)(gameEnd - gameStart),
-                    status.game, _countof(status.game) - 1);
-                status.game[wlength] = 0;
-
-                // convert \uXXXX to unicode chars
-                {
-                    WCHAR* write = status.game;
-                    WCHAR* read = status.game;
-                    while (*read && read - status.game + 6 < _countof(status.game))
-                    {
-                        if (read[0] == '\\' && read[1] == 'u')
-                        {
-                            int value;
-                            WCHAR temp = read[6];
-                            read[0] = L'0';
-                            read[1] = L'x';
-                            read[6] = 0;
-                            if (StrToIntExW(read, STIF_SUPPORT_HEX, &value))
-                            {
-                                *write++ = (WCHAR)value;
-                            }
-                            else
-                            {
-                                *write++ = L'?';
-                            }
-                            read[6] = temp;
-                            read += 6;
-                        }
-                        else
-                        {
-                            *write++ = *read++;
-                        }
-                    }
-                    *write++ = 0;
-                }
-            }
-
-            char* logoStart;
-            char* logoEnd;
-            if (FindSubstring(data, dataLength, ",\"logo\":\"", '"', &logoStart, &logoEnd))
-            {
-                status.icon = GetUserIcon(logoStart, logoEnd - logoStart);
-            }
-
-            SendMessageW(gWindow, WM_TWITCH_NOTIFY_UPDATE_USER, (WPARAM)index, (LPARAM)&status);
-        }
-    }
-    else if (StringBeginsWith(data, dataLength, error, _countof(error) - 1))
-    {
-        // user doesn't exist?
-    }
-    else
+    if (token->type != JSMN_STRING)
     {
         return 0;
     }
 
-    return 1;
+    const char* ptr = json + token->start;
+    int length = token->end - token->start;
+    while (*str)
+    {
+        if (length == 0 || *ptr++ != *str++)
+        {
+            return 0;
+        }
+        length--;
+    }
+    return length == 0;
+}
+
+static int ConverJsonStringToW(char* src, int length, WCHAR* dst, int dstLength)
+{
+    WCHAR* start = dst;
+    char* read = src;
+    while (length --> 0)
+    {
+        char ch = *read++;
+        if (ch == '\\')
+        {
+            if (length == 0)
+            {
+                break;
+            }
+            ch = *read++;
+            --length;
+            if (ch == '"') *dst++ = L'"';
+            else if (ch == '\\') *dst++ = L'\\';
+            else if (ch == '/') *dst++ = L'/';
+            else if (ch == 'b') *dst++ = L'\b';
+            else if (ch == 'f') *dst++ = L'\f';
+            else if (ch == 'n') *dst++ = L'\n';
+            else if (ch == 'r') *dst++ = L'\r';
+            else if (ch == 't') *dst++ = L'\t';
+            else if (ch == 'u')
+            {
+                if (length < 4)
+                {
+                    break;
+                }
+                int value;
+                char tmp = read[4];
+                read[-2] = '0';
+                read[-1] = 'x';
+                read[4] = 0;
+                BOOL ok = StrToIntEx(read - 2, STIF_SUPPORT_HEX, &value);
+                Assert(ok);
+                read[4] = tmp;
+                read += 4;
+                length -= 4;
+                if (value >= 0xd800 && value <= 0xdfff)
+                {
+                    if (length < 6 || read[0] != '\\' || read[1] != 'u' || dstLength < 3)
+                    {
+                        break;
+                    }
+                    int value2;
+                    tmp = read[6];
+                    read[0] = '0';
+                    read[1] = 'x';
+                    read[6] = 0;
+                    ok = StrToIntEx(read, STIF_SUPPORT_HEX, &value2);
+                    Assert(ok);
+                    read[6] = tmp;
+                    read += 6;
+                    length -= 6;
+                    if (value2 < 0xdc00 || value2 >= 0xdfff)
+                    {
+                        break;
+                    }
+
+                    *dst++ = (WCHAR)value;
+                    *dst++ = (WCHAR)value2;
+                }
+                else
+                {
+                    *dst++ = (WCHAR)value;
+                }
+            }
+        }
+        else
+        {
+            *dst++ = ch;
+        }
+
+        if (--dstLength == 0)
+        {
+            dst--;
+            break;
+        }
+    }
+    *dst = 0;
+    return (int)(dst - start);
 }
 
 static int UpdateUsers(void)
 {
-    char* data = HeapAlloc(gHeap, 0, MAX_DOWNLOAD_SIZE);
+    if (gUserCount == 0)
+    {
+        return 1;
+    }
+
+    DWORD dataLength = MAX_DOWNLOAD_SIZE;
+    char* data = HeapAlloc(gHeap, 0, 2 * MAX_DOWNLOAD_SIZE);
     if (!data)
     {
         return 0;
     }
 
-    int result = 1;
-    for (int index = 0; index < gUserCount; index++)
+    WCHAR url[4096] = L"https://api.twitch.tv/kraken/streams?channel";
+    for (int i = 0; i < gUserCount; i++)
     {
-        WCHAR url[300];
-        wnsprintfW(url, _countof(url), L"https://api.twitch.tv/kraken/streams/%s", gUsers[index].name);
+        StringCbCatW(url, _countof(url), i == 0 ? L"=" : L",");
+        StringCbCatW(url, _countof(url), gUsers[i].name);
+    }
 
-        static WCHAR headers[] = L"Client-ID: q35d4ta5iafud6yhnp8a23cj2etweq6\r\n\r\n";
+    SendMessageW(gWindow, WM_TWITCH_NOTIFY_START_UPDATE, 0, 0);
 
-        DWORD dataLength = MAX_DOWNLOAD_SIZE;
-        if (!DownloadURL(url, headers, _countof(headers) - 1, data, &dataLength) ||
-            !ParseUserData(index, data, dataLength))
+    int result = 1;
+
+    WCHAR* headers = L"Client-ID: q35d4ta5iafud6yhnp8a23cj2etweq6\r\n\r\n";
+    if (!DownloadURL(url, headers, data, &dataLength))
+    {
+        SendMessageW(gWindow, WM_TWITCH_NOTIFY_UPDATE_ERROR, (WPARAM)L"Failed to connect to Twitch!", 0);
+        result = 0;
+    }
+    else
+    {
+        jsmn_parser parser;
+        jsmn_init(&parser);
+
+        jsmntok_t tokens[1024];
+        int t = jsmn_parse(&parser, data, dataLength, tokens, _countof(tokens));
+        if (t < 1 || tokens[0].type != JSMN_OBJECT)
         {
+            SendMessage(gWindow, WM_TWITCH_NOTIFY_UPDATE_ERROR, (WPARAM)L"JSON parse error!", 0);
             result = 0;
-            break;
+        }
+        else
+        {
+            enum
+            {
+                STATE_ROOT,
+                STATE_ERROR,
+                STATE_STREAMS,
+                STATE_STREAM,
+                STATE_CHANNEL,
+            }
+            state = STATE_ROOT;
+
+            jsmn_iterator_t streams = { 0 };
+            jsmn_iterator_t stream = { 0 };
+            jsmn_iterator_t channel = { 0 };
+
+            jsmn_iterator_t iter;
+            int ok = jsmn_iterator_init(&iter, tokens, t, 0);
+            Assert(ok >= 0);
+
+            struct UserStatusOnline status;
+
+            for (;;)
+            {
+                jsmntok_t* id;
+                jsmntok_t* value;
+
+                int next = jsmn_iterator_next(&iter, &id, &value, 0);
+                if (next == 0)
+                {
+                    if (state == STATE_CHANNEL)
+                    {
+                        state = STATE_STREAM;
+                        iter = channel;
+                        continue;
+                    }
+                    if (state == STATE_STREAM)
+                    {
+                        SendMessageW(gWindow, WM_TWITCH_NOTIFY_USER_ONLINE, (WPARAM)&status, 0);
+                        state = STATE_STREAMS;
+                        iter = stream;
+                        continue;
+                    }
+                    if (state == STATE_STREAM)
+                    {
+                        state = STATE_ROOT;
+                        iter = streams;
+                        continue;
+                    }
+                    break;
+                }
+                else if (next < 0)
+                {
+                    SendMessage(gWindow, WM_TWITCH_NOTIFY_UPDATE_ERROR, (WPARAM)L"JSON parse error!", 0);
+                    result = 0;
+                    break;
+                }
+
+                if (state == STATE_CHANNEL)
+                {
+                    if (jsoneq(data, id, "name") && value->type == JSMN_STRING)
+                    {
+                        char* str = data + value->start;
+                        int length = value->end - value->start;
+                        ConverJsonStringToW(str, length, status.user, _countof(status.user));
+                    }
+                    else if (jsoneq(data, id, "logo") && value->type == JSMN_STRING)
+                    {
+                        char* str = data + value->start;
+                        int length = value->end - value->start;
+
+                        int urlLength = ConverJsonStringToW(str, length, url, _countof(url));
+                        status.icon = GetUserIcon(url, urlLength, data + MAX_DOWNLOAD_SIZE);
+                    }
+                }
+                else if (state == STATE_STREAM)
+                {
+                    if (jsoneq(data, id, "game") && value->type == JSMN_STRING)
+                    {
+                        char* str = data + value->start;
+                        int length = value->end - value->start;
+                        ConverJsonStringToW(str, length, status.game, _countof(status.game));
+                    }
+                    else if (jsoneq(data, id, "channel") && value->type == JSMN_OBJECT)
+                    {
+                        channel = iter;
+                        state = STATE_CHANNEL;
+                        jsmn_iterator_init(&iter, tokens, t, (int)(value - tokens));
+                    }
+                }
+                else if (state == STATE_STREAMS && value->type == JSMN_OBJECT)
+                {
+                    stream = iter;
+                    state = STATE_STREAM;
+                    jsmn_iterator_init(&iter, tokens, t, (int)(value - tokens));
+
+                    status.user[0] = 0;
+                    status.game[0] = 0;
+                    status.icon = NULL;
+                }
+                else if (state == STATE_ERROR)
+                {
+                    if (jsoneq(data, id, "message") && value->type == JSMN_STRING)
+                    {
+                        WCHAR message[256];
+                        char* str = data + value->start;
+                        int length = value->end - value->start;
+                        ConverJsonStringToW(str, length, message, _countof(message));
+                        SendMessage(gWindow, WM_TWITCH_NOTIFY_UPDATE_ERROR, (WPARAM)message,
+                            (LPARAM)L"Error from Twitch!");
+                        result = 0;
+                        break;
+                    }
+                }
+                else
+                {
+                    if (jsoneq(data, id, "error"))
+                    {
+                        state = STATE_ERROR;
+                    }
+                    else if (jsoneq(data, id, "streams") && value->type == JSMN_ARRAY)
+                    {
+                        streams = iter;
+                        state = STATE_STREAMS;
+                        jsmn_iterator_init(&iter, tokens, t, (int)(value - tokens));
+                    }
+                }
+            }
         }
     }
+
+    SendMessageW(gWindow, WM_TWITCH_NOTIFY_END_UPDATE, 0, 0);
 
     HeapFree(gHeap, 0, data);
     return result;
@@ -958,11 +1117,7 @@ static DWORD UpdateThread(LPVOID arg)
 
         if (wait == WAIT_OBJECT_0)
         {
-            if (!UpdateUsers())
-            {
-                gLastPopupUserIndex = -1;
-                ShowNotification(L"Failed to connect to Twitch!", NULL, NIIF_ERROR, NULL);
-            }
+            UpdateUsers();
         }
         else if (wait == WAIT_OBJECT_0 + 1)
         {

@@ -784,8 +784,8 @@ static int jsoneq(const char* json, jsmntok_t* token, const char* str)
 
 static int ConverJsonStringToW(char* src, int length, WCHAR* dst, int dstLength)
 {
-    WCHAR* start = dst;
     char* read = src;
+    char* write = src;
     while (length --> 0)
     {
         char ch = *read++;
@@ -797,20 +797,21 @@ static int ConverJsonStringToW(char* src, int length, WCHAR* dst, int dstLength)
             }
             ch = *read++;
             --length;
-            if (ch == '"') *dst++ = L'"';
-            else if (ch == '\\') *dst++ = L'\\';
-            else if (ch == '/') *dst++ = L'/';
-            else if (ch == 'b') *dst++ = L'\b';
-            else if (ch == 'f') *dst++ = L'\f';
-            else if (ch == 'n') *dst++ = L'\n';
-            else if (ch == 'r') *dst++ = L'\r';
-            else if (ch == 't') *dst++ = L'\t';
+            if (ch == '"') *write++ = L'"';
+            else if (ch == '\\') *write++ = L'\\';
+            else if (ch == '/') *write++ = L'/';
+            else if (ch == 'b') *write++ = L'\b';
+            else if (ch == 'f') *write++ = L'\f';
+            else if (ch == 'n') *write++ = L'\n';
+            else if (ch == 'r') *write++ = L'\r';
+            else if (ch == 't') *write++ = L'\t';
             else if (ch == 'u')
             {
                 if (length < 4)
                 {
                     break;
                 }
+
                 int value;
                 char tmp = read[4];
                 read[-2] = '0';
@@ -821,12 +822,14 @@ static int ConverJsonStringToW(char* src, int length, WCHAR* dst, int dstLength)
                 read[4] = tmp;
                 read += 4;
                 length -= 4;
+
                 if (value >= 0xd800 && value <= 0xdfff)
                 {
-                    if (length < 6 || read[0] != '\\' || read[1] != 'u' || dstLength < 3)
+                    if (length < 6 || read[0] != '\\' || read[1] != 'u')
                     {
                         break;
                     }
+
                     int value2;
                     tmp = read[6];
                     read[0] = '0';
@@ -842,28 +845,47 @@ static int ConverJsonStringToW(char* src, int length, WCHAR* dst, int dstLength)
                         break;
                     }
 
-                    *dst++ = (WCHAR)value;
-                    *dst++ = (WCHAR)value2;
+                    value = ((value - 0xd800) << 10) + (value2 - 0xdc00) + 0x10000;
+                }
+
+                if (value < 0x80)
+                {
+                    *write++ = (char)value;
+                }
+                else if (value < 0x800)
+                {
+                    *write++ = (char)(0xc0 | (value >> 6));
+                    *write++ = (char)(0x80 | (value & 0x3f));
+                }
+                else if (value < 0x10000)
+                {
+                    *write++ = (char)(0xe0 | (value >> 12));
+                    *write++ = (char)(0x80 | ((value >> 6) & 0x3f));
+                    *write++ = (char)(0x80 | (value & 0x3f));
                 }
                 else
                 {
-                    *dst++ = (WCHAR)value;
+                    Assert(value <= 0x10ffff);
+                    *write++ = (char)(0xf0 | (value >> 18));
+                    *write++ = (char)(0x80 | ((value >> 12) & 0x3f));
+                    *write++ = (char)(0x80 | ((value >> 6) & 0x3f));
+                    *write++ = (char)(0x80 | ((value & 0x3f)));
                 }
+            }
+            else
+            {
+                break;
             }
         }
         else
         {
-            *dst++ = ch;
-        }
-
-        if (--dstLength == 0)
-        {
-            dst--;
-            break;
+            *write++ = ch;
         }
     }
-    *dst = 0;
-    return (int)(dst - start);
+
+    dstLength = MultiByteToWideChar(CP_UTF8, 0, src, (int)(write - src), dst, dstLength);
+    dst[dstLength] = 0;
+    return dstLength;
 }
 
 static int UpdateUsers(void)

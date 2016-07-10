@@ -90,6 +90,7 @@ static int gActive;
 static int gLastPopupUserIndex = -1;
 
 static HANDLE gHeap;
+static HICON gTwitchNotifyIcon;
 static HWND gWindow;
 static HINTERNET gInternet;
 static IWICImagingFactory* gWicFactory;
@@ -119,7 +120,6 @@ static void ShowNotification(LPWSTR message, LPWSTR title, DWORD flags, HICON ic
         .uFlags = NIF_INFO,
         .dwInfoFlags = flags | (icon ? NIIF_LARGE_ICON : 0),
         .hBalloonIcon = icon,
-
     };
     StrCpyNW(data.szInfo, message, _countof(data.szInfo));
     StrCpyNW(data.szInfoTitle, title ? title : TWITCH_NOTIFY_TITLE, _countof(data.szInfoTitle));
@@ -144,7 +144,7 @@ static void ShowUserOnlineNotification(struct UserStatusOnline* status)
         wnsprintfW(message, _countof(message), L"Playing '%s'", status->game);
     }
 
-    ShowNotification(message, title, NIIF_USER, status->icon);
+    ShowNotification(message, title, NIIF_USER, status->icon ? status->icon : gTwitchNotifyIcon);
 }
 
 static void OpenTwitchUser(int index)
@@ -241,7 +241,7 @@ static void AddTrayIcon(HWND window)
         .hWnd = window,
         .uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP,
         .uCallbackMessage = WM_TWITCH_NOTIFY_COMMAND,
-        .hIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1)),
+        .hIcon = gTwitchNotifyIcon,
     };
     Assert(data.hIcon);
     StrCpyNW(data.szTip, TWITCH_NOTIFY_TITLE, _countof(data.szTip));
@@ -1226,6 +1226,9 @@ void WinMainCRTStartup(void)
 
     ATOM atom = RegisterClassExW(&wc);
     Assert(atom);
+
+    gTwitchNotifyIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
+    Assert(gTwitchNotifyIcon);
 
     SetupWIC();
     FindExeFolder(wc.hInstance);

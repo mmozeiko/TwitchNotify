@@ -489,8 +489,9 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
 
 static int DownloadURL(WCHAR* url, WCHAR* headers, char* data, DWORD* dataLength)
 {
-    HINTERNET connection = InternetOpenUrlW(gInternet, url, headers, (DWORD)-1,
-        INTERNET_FLAG_EXISTING_CONNECT | INTERNET_FLAG_KEEP_CONNECTION | INTERNET_FLAG_SECURE, 0);
+    DWORD flags = INTERNET_FLAG_EXISTING_CONNECT | INTERNET_FLAG_KEEP_CONNECTION |
+        INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_SECURE;
+    HINTERNET connection = InternetOpenUrlW(gInternet, url, headers, (DWORD)-1, flags, 0);
     if (!connection)
     {
         return 0;

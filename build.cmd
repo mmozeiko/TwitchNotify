@@ -33,7 +33,7 @@ if 1 == 1 (
         )
         set CL=%CL% /DTWITCH_NOTIFY_VERSION=\"r!REV!-!COMMIT!\"
     )
-    set CL=!CL! /Ox /GF /Gy
+    set CL=!CL! /Ox /Os /GF /Gy
     set LINK=%LINK% /OPT:REF /OPT:ICF
 ) else (
     rem debug

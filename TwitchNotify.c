@@ -102,8 +102,6 @@ static WCHAR gExeFolder[MAX_PATH + 1];
 
 static UINT WM_TASKBARCREATED;
 
-int _fltused;
-
 #pragma function ("memset")
 void* memset(void* dst, int value, size_t count)
 {

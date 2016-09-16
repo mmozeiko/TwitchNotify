@@ -45,10 +45,16 @@
 #define WM_TWITCH_NOTIFY_UPDATE_ERROR    (WM_USER + 8)
 
 #define CMD_OPEN_HOMEPAGE       1
-#define CMD_TOGGLE_ACTIVE       2
-#define CMD_USE_LIVESTREAMER    3
-#define CMD_EDIT_LIVESTREAMERRC 4
-#define CMD_EDIT_CONFIG_FILE    5
+#define CMD_USE_LIVESTREAMER    2
+#define CMD_EDIT_LIVESTREAMERRC 3
+#define CMD_USE_MPV_YDL         4
+#define CMD_YDL_FORMAT_SOURCE   5
+#define CMD_YDL_FORMAT_HIGH     6
+#define CMD_YDL_FORMAT_MEDIUM   7
+#define CMD_YDL_FORMAT_LOW      8
+#define CMD_YDL_FORMAT_MOBILE   9
+#define CMD_TOGGLE_ACTIVE       10
+#define CMD_EDIT_CONFIG_FILE    11
 #define CMD_QUIT                255
 
 #define TWITCH_NOTIFY_CONFIG L"TwitchNotify.txt"
@@ -85,6 +91,8 @@ struct UserStatusOnline
 static struct User gUsers[MAX_USER_COUNT];
 static int gUserCount;
 
+static int gUseMpvYdl;
+static int gYdlFormat;
 static int gUseLivestreamer;
 static int gActive;
 static int gLastPopupUserIndex = -1;
@@ -152,17 +160,27 @@ static void OpenTwitchUser(int index)
         return;
     }
 
-    WCHAR url[300];
-    wnsprintfW(url, _countof(url), L"https://www.twitch.tv/%s", gUsers[index].name);
+    WCHAR args[400];
+    wnsprintfW(args, _countof(args), L"https://www.twitch.tv/%s", gUsers[index].name);
 
-    if (gUseLivestreamer && gUsers[index].online)
+    if (gUsers[index].online)
     {
-        ShellExecuteW(NULL, L"open", L"livestreamer.exe", url, NULL, SW_HIDE);
+        if (gUseLivestreamer)
+        {
+            StrCatBuffW(args, L" --http-header Client-ID=jzkbprff40iqj646a697cyrvl0zt2m6", _countof(args));
+            ShellExecuteW(NULL, L"open", L"livestreamer.exe", args, NULL, SW_HIDE);
+            return;
+        }
+        else if (gUseMpvYdl)
+        {
+            static const WCHAR* formats[] = { L"Source", L"High", L"Medium", L"Low", L"Mobile" };
+            StrCatBuffW(args, L" --ytdl-format ", _countof(args));
+            StrCatBuffW(args, formats[gYdlFormat], _countof(args));
+            ShellExecuteW(NULL, L"open", L"mpv.exe", args, NULL, SW_HIDE);
+            return;
+        }
     }
-    else
-    {
-        ShellExecuteW(NULL, L"open", url, NULL, NULL, SW_SHOWNORMAL);
-    }
+    ShellExecuteW(NULL, L"open", args, NULL, NULL, SW_SHOWNORMAL);
 }
 
 static void ToggleActive(HWND window)
@@ -195,12 +213,42 @@ static void ToggleLivestreamer(void)
     gUseLivestreamer = !gUseLivestreamer;
     if (gUseLivestreamer)
     {
-        if (!IsLivestreamerInPath())
+        if (IsLivestreamerInPath())
+        {
+            gUseMpvYdl = 0;
+        }
+        else
         {
             MessageBoxW(NULL, L"Cannot find 'livestreamer.exe' in PATH!",
                 TWITCH_NOTIFY_TITLE, MB_ICONEXCLAMATION);
 
             gUseLivestreamer = 0;
+        }
+    }
+}
+
+static int IsMpvAndYdlInPath(void)
+{
+    WCHAR path[MAX_PATH];
+    return FindExecutableW(L"mpv.exe", NULL, path) > (HINSTANCE)32
+        && FindExecutableW(L"youtube-dl.exe", NULL, path) > (HINSTANCE)32;
+}
+
+static void ToggleMpvYdl(void)
+{
+    gUseMpvYdl = !gUseMpvYdl;
+    if (gUseMpvYdl)
+    {
+        if (IsMpvAndYdlInPath())
+        {
+            gUseLivestreamer = 0;
+        }
+        else
+        {
+            MessageBoxW(NULL, L"Cannot find 'mpv.exe' and 'youtube-dl.exe' in PATH!",
+                TWITCH_NOTIFY_TITLE, MB_ICONEXCLAMATION);
+
+            gUseMpvYdl = 0;
         }
     }
 }
@@ -299,6 +347,24 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
         {
             if (lparam == WM_RBUTTONUP)
             {
+                HMENU mpvYdl = CreatePopupMenu();
+                Assert(mpvYdl);
+
+                AppendMenuW(mpvYdl, gYdlFormat == 0 ? MF_CHECKED : MF_UNCHECKED, CMD_YDL_FORMAT_SOURCE, L"Source");
+                AppendMenuW(mpvYdl, gYdlFormat == 1 ? MF_CHECKED : MF_UNCHECKED, CMD_YDL_FORMAT_HIGH, L"High (1280x720)");
+                AppendMenuW(mpvYdl, gYdlFormat == 2 ? MF_CHECKED : MF_UNCHECKED, CMD_YDL_FORMAT_MEDIUM, L"Medium (852x480)");
+                AppendMenuW(mpvYdl, gYdlFormat == 3 ? MF_CHECKED : MF_UNCHECKED, CMD_YDL_FORMAT_LOW, L"Low (640x360)");
+                AppendMenuW(mpvYdl, gYdlFormat == 4 ? MF_CHECKED : MF_UNCHECKED, CMD_YDL_FORMAT_MOBILE, L"Mobile (400x226)");
+
+                HMENU settings = CreatePopupMenu();
+                Assert(settings);
+
+                AppendMenuW(settings, gUseLivestreamer ? MF_CHECKED : MF_UNCHECKED, CMD_USE_LIVESTREAMER, L"Use livestreamer");
+                AppendMenuW(settings, gUseLivestreamer ? MF_STRING : MF_GRAYED, CMD_EDIT_LIVESTREAMERRC, L"Edit livestreamerrc file");
+                AppendMenuW(settings, MF_SEPARATOR, 0, NULL);
+                AppendMenuW(settings, gUseMpvYdl ? MF_CHECKED : MF_UNCHECKED, CMD_USE_MPV_YDL, L"Use mpv && youtube-dl");
+                AppendMenuW(settings, (gUseMpvYdl ? 0 : MF_GRAYED) | MF_POPUP, (UINT_PTR)mpvYdl, L"youtube-dl format");
+
                 HMENU users = CreatePopupMenu();
                 Assert(users);
 
@@ -317,8 +383,8 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
 #endif
                 AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
                 AppendMenuW(menu, gActive ? MF_CHECKED : MF_UNCHECKED, CMD_TOGGLE_ACTIVE, L"Active");
-                AppendMenuW(menu, gUseLivestreamer ? MF_CHECKED : MF_UNCHECKED, CMD_USE_LIVESTREAMER, L"Use livestreamer");
-                AppendMenuW(menu, gUseLivestreamer ? MF_STRING : MF_GRAYED, CMD_EDIT_LIVESTREAMERRC, L"Edit livestreamerrc file");
+                AppendMenuW(menu, MF_POPUP, (UINT_PTR)settings, L"Settings");
+
                 AppendMenuW(menu, MF_STRING, CMD_EDIT_CONFIG_FILE, L"Modify user list");
 
                 if (gUserCount == 0)
@@ -352,6 +418,16 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
                 case CMD_EDIT_LIVESTREAMERRC:
                     EditLivestreamerConfig();
                     break;
+                case CMD_USE_MPV_YDL:
+                    ToggleMpvYdl();
+                    break;
+                case CMD_YDL_FORMAT_SOURCE:
+                case CMD_YDL_FORMAT_HIGH:
+                case CMD_YDL_FORMAT_MEDIUM:
+                case CMD_YDL_FORMAT_LOW:
+                case CMD_YDL_FORMAT_MOBILE:
+                    gYdlFormat = cmd - CMD_YDL_FORMAT_SOURCE;
+                    break;
                 case CMD_EDIT_CONFIG_FILE:
                     EditConfigFile();
                     break;
@@ -365,6 +441,8 @@ static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM 
 
                 DestroyMenu(menu);
                 DestroyMenu(users);
+                DestroyMenu(settings);
+                DestroyMenu(mpvYdl);
             }
             else if (lparam == NIN_BALLOONUSERCLICK)
             {
@@ -912,7 +990,7 @@ static int UpdateUsers(void)
 
     int result = 1;
 
-    WCHAR* headers = L"Client-ID: q35d4ta5iafud6yhnp8a23cj2etweq6\r\n\r\n";
+    WCHAR* headers = L"Client-ID: jzkbprff40iqj646a697cyrvl0zt2m6\r\n\r\n";
     if (!DownloadURL(url, headers, data, &dataLength))
     {
         SendMessageW(gWindow, WM_TWITCH_NOTIFY_UPDATE_ERROR, (WPARAM)L"Failed to connect to Twitch!", 0);
@@ -1231,7 +1309,11 @@ void WinMainCRTStartup(void)
 
     SetupWIC();
     FindExeFolder(wc.hInstance);
-    if (IsLivestreamerInPath())
+    if (IsMpvAndYdlInPath())
+    {
+        gUseMpvYdl = 1;
+    }
+    else if (IsLivestreamerInPath())
     {
         gUseLivestreamer = 1;
     }

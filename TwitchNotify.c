@@ -1205,7 +1205,7 @@ static void ReloadUsers(void)
     }
 }
 
-static DWORD UpdateThread(LPVOID arg)
+static DWORD CALLBACK UpdateThread(LPVOID arg)
 {
     (void)arg;
 
@@ -1226,7 +1226,7 @@ static DWORD UpdateThread(LPVOID arg)
     }
 }
 
-static DWORD ConfigThread(LPVOID arg)
+static DWORD CALLBACK ConfigThread(LPVOID arg)
 {
     (void)arg;
 

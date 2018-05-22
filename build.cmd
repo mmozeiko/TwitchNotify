@@ -1,21 +1,7 @@
 @echo off
 setlocal enabledelayedexpansion
 
-if not "%VS140COMNTOOLS%" == "" goto vs2015
-if not "%VS120COMNTOOLS%" == "" goto vs2013
-
-echo Could not find VS2013 or VS2015.
-goto :eof
-
-:vs2015
-    call "%VS140COMNTOOLS%..\..\VC\vcvarsall.bat" amd64
-    goto vssetupdone
-
-:vs2013
-    call "%VS120COMNTOOLS%..\..\VC\vcvarsall.bat" amd64
-    goto vssetupdone
-
-:vssetupdone
+call "C:\Program Files (x86)\Microsoft Visual Studio\2017\Community\VC\Auxiliary\Build\vcvarsall.bat"
 
 set CL=/nologo /errorReport:none /Wall /WX /GS- /Gm- /GR- /fp:fast /EHa-
 set LINK=/errorReport:none /INCREMENTAL:NO /SUBSYSTEM:WINDOWS

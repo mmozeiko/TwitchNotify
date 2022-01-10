@@ -1,5 +1,8 @@
+.vs
 *.exe
 *.pdb
 *.res
 *.obj
 *.zip
+*.lib
+*.exp

@@ -1,1357 +1,1035 @@
 #define INITGUID
 #define COBJMACROS
-
-#pragma warning (disable : 4204 4711 4710 4820)
-#pragma warning (push, 0)
-
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
-#include <strsafe.h>
 #include <shlobj.h>
+#include <shellapi.h>
 #include <shlwapi.h>
-#include <wininet.h>
-#include <wincodec.h>
+#include <winhttp.h>
 
-#include "jsmn.c" // https://github.com/zserge/jsmn
-#include "jsmn_iterator.c" // https://github.com/zserge/jsmn/pull/69
-
-#pragma warning (pop)
-
-// TODO
-// automatic check for updates https://api.github.com/repos/mmozeiko/TwitchNotify/git/refs/heads/master
+#pragma comment (lib, "kernel32.lib")
+#pragma comment (lib, "user32.lib")
+#pragma comment (lib, "shell32.lib")
+#pragma comment (lib, "shlwapi.lib")
+#pragma comment (lib, "ole32.lib")
+#pragma comment (lib, "winhttp.lib")
 
 #ifdef _DEBUG
-
-#define Assert(cond) do \
-{                       \
-    if (!(cond))        \
-    {                   \
-        __debugbreak(); \
-    }                   \
-} while (0)
-
+#define Assert(Cond) do { if (!(Cond)) __debugbreak(); } while (0)
 #else
-
-#define Assert(cond) ((void)(cond))
-
+#define Assert(Cond) ((void)(Cond))
 #endif
+
+#define HR(hr) do { HRESULT _hr = (hr); Assert(SUCCEEDED(_hr)); } while (0)
+
+#include "WindowsToast.h"
+#include "WindowsJson.h"
 
 #define WM_TWITCH_NOTIFY_COMMAND         (WM_USER + 1)
 #define WM_TWITCH_NOTIFY_ALREADY_RUNNING (WM_USER + 2)
-#define WM_TWITCH_NOTIFY_REMOVE_USERS    (WM_USER + 3)
-#define WM_TWITCH_NOTIFY_ADD_USER        (WM_USER + 4)
-#define WM_TWITCH_NOTIFY_START_UPDATE    (WM_USER + 5)
-#define WM_TWITCH_NOTIFY_USER_ONLINE     (WM_USER + 6)
-#define WM_TWITCH_NOTIFY_END_UPDATE      (WM_USER + 7)
-#define WM_TWITCH_NOTIFY_UPDATE_ERROR    (WM_USER + 8)
+#define WM_TWITCH_NOTIFY_TRAY_ICON       (WM_USER + 3)
 
-#define CMD_OPEN_HOMEPAGE       1
-#define CMD_USE_LIVESTREAMER    2
-#define CMD_EDIT_LIVESTREAMERRC 3
-#define CMD_USE_MPV_YDL         4
-#define CMD_YDL_FORMAT_SOURCE   5
-#define CMD_YDL_FORMAT_HIGH     6
-#define CMD_YDL_FORMAT_MEDIUM   7
-#define CMD_YDL_FORMAT_LOW      8
-#define CMD_YDL_FORMAT_MOBILE   9
-#define CMD_TOGGLE_ACTIVE       10
-#define CMD_EDIT_CONFIG_FILE    11
-#define CMD_QUIT                255
+#define CMD_OPEN_HOMEPAGE 10
+#define CMD_USE_MPV       20
+#define CMD_QUALITY       30
+#define CMD_EDIT_USERS    40
+#define CMD_EXIT          50
+#define CMD_USER          60 // should be last
 
-#define TWITCH_NOTIFY_CONFIG L"TwitchNotify.txt"
-#define TWITCH_NOTIFY_TITLE L"Twitch Notify"
+#define TWITCH_NOTIFY_NAME     L"Twitch Notify"
+#define TWITCH_NOTIFY_INI      L"TwitchNotify.ini"
+#define TWITCH_NOTIFY_APPID    L"TwitchNotify.TwitchNotify" // CompanyName.ProductName
+#define TWITCH_NOTIFY_HOMEPAGE L"https://github.com/mmozeiko/TwitchNotify/"
 
-#define MAX_USER_COUNT        100 // max user count that can be requested in one Twitch API call
-#define MAX_USER_NAME_LENGTH  256
-#define MAX_GAME_NAME_LENGTH  128
-#define MAX_WINDOWS_ICON_SIZE 256
+#define MAX_USER_COUNT    50 // oficially documented user count limit for Twitch websocket
+#define MAX_STRING_LENGTH 256
 
-#define MAX_DOWNLOAD_SIZE (1024 * 1024) // 1 MiB
+#define MAX_BUFFER_SIZE     (1024*1024)   // 1 MiB
+#define MAX_IMAGE_CACHE_AGE (60*60*24*7)  // 1 week in seconds
 
-#define CHECK_USERS_TIMER_INTERVAL 60 // seconds
-#define RELOAD_CONFIG_TIMER_DELAY 100 // msec
+#define TIMER_RELOAD_USERS 1
+#define TIMER_RELOAD_USERS_DELAY 100 // msec
 
-#define UPDATE_USERS_TIMER_ID  1
-#define RELOAD_CONFIG_TIMER_ID 2
+#define TIMER_WEBSOCKET_PING 2
+#define TIMER_WEBSOCKET_PING_INTERVAL (2*60*1000) // 2 minutes in msec
 
-#define MAX_ICON_CACHE_AGE (60*60*24*7) // 1 week
-
-struct User
+struct
 {
-    WCHAR name[MAX_USER_NAME_LENGTH];
-    int online;
+	LPCWSTR Name;
+	LPCSTR Format;
+}
+static const Quality[] =
+{
+	{ L"Source",     "best"                              },
+	{ L"1080p @ 60", "best[height<=?1080]/best"          },
+	{ L"1080p",      "best[height<=?1080][fps<=30]/best" },
+	{ L"720p @ 60",  "best[height<=?720]/best"           },
+	{ L"720p",       "best[height<=?720][fps<=?30]/best" },
+	{ L"480p",       "best[height<=?480]/best"           },
+	{ L"360p",       "best[height<=?360]/best"           },
+	{ L"160p",       "best[height<=?160]/best"           },
 };
 
-struct UserStatusOnline
-{
-    WCHAR user[MAX_GAME_NAME_LENGTH];
-    WCHAR game[MAX_GAME_NAME_LENGTH];
-    HICON icon;
-};
-
-static struct User gUsers[MAX_USER_COUNT];
-static int gUserCount;
-
-static int gUseMpvYdl;
-static int gYdlFormat;
-static int gUseLivestreamer;
-static int gActive;
-static int gLastPopupUserIndex = -1;
-
-static HANDLE gHeap;
-static HICON gTwitchNotifyIcon;
-static HWND gWindow;
-static HINTERNET gInternet;
-static IWICImagingFactory* gWicFactory;
-
-static HANDLE gUpdateEvent;
-static HANDLE gConfigEvent;
-
-static WCHAR gExeFolder[MAX_PATH + 1];
-
+// message sent when explorer.exe restarts, to restore tray icons
 static UINT WM_TASKBARCREATED;
 
-#pragma function ("memset")
-void* memset(void* dst, int value, size_t count)
+typedef struct
 {
-    __stosb((BYTE*)dst, (BYTE)value, count);
-    return dst;
+	WCHAR Name[MAX_STRING_LENGTH];
+	WCHAR DisplayName[MAX_STRING_LENGTH];
+	WCHAR GameName[MAX_STRING_LENGTH];
+	WCHAR StreamName[MAX_STRING_LENGTH];
+	WCHAR ImagePath[MAX_PATH];
+	UINT UserId;
+	BOOL IsOnline;
+} User;
+
+struct
+{
+	HICON Icon[2];
+	HWND Window;
+	WindowsToast Toast;
+	HINTERNET Session;
+
+	WCHAR IniPath[MAX_PATH];
+	FILETIME LastIniWriteTime;
+
+	HANDLE ExeFolderHandle;
+	BYTE ExeFolderChanges[4096];
+	OVERLAPPED ExeFolderOverlapped;
+
+	UINT Quality;
+	BOOL UseMpv;
+
+	User Users[MAX_USER_COUNT];
+	int UserCount;
+
+	HANDLE ReloadEvent;
+	HINTERNET Websocket;
+	char Buffer[MAX_BUFFER_SIZE];
+}
+static State;
+
+static void AddTrayIcon(HWND Window)
+{
+	NOTIFYICONDATAW Data =
+	{
+		.cbSize = sizeof(Data),
+		.hWnd = Window,
+		.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP,
+		.uCallbackMessage = WM_TWITCH_NOTIFY_COMMAND,
+		.hIcon = State.Icon[0],
+	};
+	StrCpyNW(Data.szInfoTitle, TWITCH_NOTIFY_NAME, ARRAYSIZE(Data.szInfoTitle));
+	Assert(Shell_NotifyIconW(NIM_ADD, &Data));
 }
 
-static void ShowNotification(LPWSTR message, LPWSTR title, DWORD flags, HICON icon)
+static void RemoveTrayIcon(HWND Window)
 {
-    NOTIFYICONDATAW data =
-    {
-        .cbSize = sizeof(data),
-        .hWnd = gWindow,
-        .uFlags = NIF_INFO,
-        .dwInfoFlags = flags | (icon ? NIIF_LARGE_ICON : 0),
-        .hBalloonIcon = icon,
-    };
-    StrCpyNW(data.szInfo, message, _countof(data.szInfo));
-    StrCpyNW(data.szInfoTitle, title ? title : TWITCH_NOTIFY_TITLE, _countof(data.szInfoTitle));
-
-    BOOL ret = Shell_NotifyIconW(NIM_MODIFY, &data);
-    Assert(ret);
+	NOTIFYICONDATAW Data =
+	{
+		.cbSize = sizeof(Data),
+		.hWnd = Window,
+	};
+	Assert(Shell_NotifyIconW(NIM_DELETE, &Data));
 }
 
-static void ShowUserOnlineNotification(struct UserStatusOnline* status)
+static void UpdateTrayIcon(HWND Window, HICON Icon)
 {
-    WCHAR title[1024];
-    wnsprintfW(title, _countof(title), L"'%s' just went live!", status->user);
-
-    WCHAR message[1024];
-
-    if (status->game[0] == 0)
-    {
-        StrCpyNW(message, L"Playing unknown game", _countof(message));
-    }
-    else
-    {
-        wnsprintfW(message, _countof(message), L"Playing '%s'", status->game);
-    }
-
-    ShowNotification(message, title, NIIF_USER, status->icon ? status->icon : gTwitchNotifyIcon);
+	NOTIFYICONDATAW Data =
+	{
+		.cbSize = sizeof(Data),
+		.hWnd = Window,
+		.uFlags = NIF_ICON,
+		.hIcon = Icon,
+	};
+	Assert(Shell_NotifyIconW(NIM_MODIFY, &Data));
 }
 
-static void OpenTwitchUser(int index)
+static void ShowTrayMessage(HWND Window, DWORD InfoType, LPCWSTR Message)
 {
-    if (index < 0 || index >= gUserCount)
-    {
-        return;
-    }
-
-    WCHAR args[400];
-    wnsprintfW(args, _countof(args), L"https://www.twitch.tv/%s", gUsers[index].name);
-
-    if (gUsers[index].online)
-    {
-        if (gUseLivestreamer)
-        {
-            StrCatBuffW(args, L" --http-header Client-ID=jzkbprff40iqj646a697cyrvl0zt2m6", _countof(args));
-            ShellExecuteW(NULL, L"open", L"livestreamer.exe", args, NULL, SW_HIDE);
-            return;
-        }
-        else if (gUseMpvYdl)
-        {
-            static const WCHAR* formats[] = { L"Source", L"High", L"Medium", L"Low", L"Mobile" };
-            StrCatBuffW(args, L" --ytdl-format ", _countof(args));
-            StrCatBuffW(args, formats[gYdlFormat], _countof(args));
-            ShellExecuteW(NULL, L"open", L"mpv.exe", args, NULL, SW_HIDE);
-            return;
-        }
-    }
-    ShellExecuteW(NULL, L"open", args, NULL, NULL, SW_SHOWNORMAL);
+	NOTIFYICONDATAW Data =
+	{
+		.cbSize = sizeof(Data),
+		.hWnd = Window,
+		.uFlags = NIF_INFO,
+		.dwInfoFlags = InfoType,
+		.hIcon = State.Icon[0],
+	};
+	StrCpyNW(Data.szInfo, Message, ARRAYSIZE(Data.szInfo));
+	StrCpyNW(Data.szInfoTitle, TWITCH_NOTIFY_NAME, ARRAYSIZE(Data.szInfoTitle));
+	Assert(Shell_NotifyIconW(NIM_MODIFY, &Data));
 }
 
-static void ToggleActive(HWND window)
+static void WINAPI OnMonitorIniChanges(DWORD ErrorCode, DWORD NumberOfBytesTransfered, LPOVERLAPPED Overlapped)
 {
-    if (gActive)
-    {
-        KillTimer(window, UPDATE_USERS_TIMER_ID);
-        for (int i = 0; i < gUserCount; i++)
-        {
-            gUsers[i].online = 0;
-        }
-    }
-    else
-    {
-        UINT_PTR timer = SetTimer(window, UPDATE_USERS_TIMER_ID, CHECK_USERS_TIMER_INTERVAL * 1000, NULL);
-        Assert(timer);
-        SetEvent(gUpdateEvent);
-    }
-    gActive = !gActive;
+	if (ErrorCode == ERROR_SUCCESS)
+	{
+		FILE_NOTIFY_INFORMATION* Info = (void*)State.ExeFolderChanges;
+
+		while ((char*)Info + sizeof(*Info) <= State.ExeFolderChanges + NumberOfBytesTransfered)
+		{
+			if (StrCmpNW(TWITCH_NOTIFY_INI, Info->FileName, Info->FileNameLength) == 0)
+			{
+				if (Info->Action == FILE_ACTION_REMOVED)
+				{
+					ShowTrayMessage(State.Window, NIIF_WARNING, L"Config file '" TWITCH_NOTIFY_NAME L"' deleted");
+				}
+				SetTimer(State.Window, TIMER_RELOAD_USERS, TIMER_RELOAD_USERS_DELAY, NULL);
+			}
+			if (Info->NextEntryOffset == 0)
+			{
+				break;
+			}
+			Info = (void*)((char*)Info + Info->NextEntryOffset);
+		}
+	}
+
+	BOOL Ok = ReadDirectoryChangesW(
+		State.ExeFolderHandle,
+		State.ExeFolderChanges,
+		ARRAYSIZE(State.ExeFolderChanges),
+		FALSE,
+		FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE,
+		NULL,
+		&State.ExeFolderOverlapped,
+		NULL);
+	Assert(Ok);
 }
 
-static int IsLivestreamerInPath(void)
+static BOOL IsMpvInPath(void)
 {
-    WCHAR livestreamer[MAX_PATH];
-    return FindExecutableW(L"livestreamer.exe", NULL, livestreamer) > (HINSTANCE)32;
+	WCHAR mpv[MAX_PATH];
+	return FindExecutableW(L"mpv.exe", NULL, mpv) > (HINSTANCE)32;
 }
 
-static void ToggleLivestreamer(void)
+static void OpenMpvUrl(LPCWSTR Url)
 {
-    gUseLivestreamer = !gUseLivestreamer;
-    if (gUseLivestreamer)
-    {
-        if (IsLivestreamerInPath())
-        {
-            gUseMpvYdl = 0;
-        }
-        else
-        {
-            MessageBoxW(NULL, L"Cannot find 'livestreamer.exe' in PATH!",
-                TWITCH_NOTIFY_TITLE, MB_ICONEXCLAMATION);
+	WCHAR Args[1024];
+	wsprintfW(Args, L"--profile=low-latency --ytdl-format=\"%S\" %s", Quality[State.Quality].Format, Url);
 
-            gUseLivestreamer = 0;
-        }
-    }
+	ShellExecuteW(NULL, L"open", L"mpv.exe", Args, NULL, SW_SHOWNORMAL);
 }
 
-static int IsMpvAndYdlInPath(void)
+static int XmlEscape(WCHAR* Dst, LPCWSTR String)
 {
-    WCHAR path[MAX_PATH];
-    return FindExecutableW(L"mpv.exe", NULL, path) > (HINSTANCE)32
-        && FindExecutableW(L"youtube-dl.exe", NULL, path) > (HINSTANCE)32;
+	WCHAR* Ptr = Dst;
+	for (const WCHAR* C = String; *C; C++)
+	{
+		if (*C == L'"')       Ptr += wsprintfW(Ptr, L"&quot;");
+		else if (*C == L'\'') Ptr += wsprintfW(Ptr, L"&apos;");
+		else if (*C == L'<')  Ptr += wsprintfW(Ptr, L"&lt;");
+		else if (*C == L'>')  Ptr += wsprintfW(Ptr, L"&gt;");
+		else if (*C == L'&')  Ptr += wsprintfW(Ptr, L"&amp;");
+		else *Ptr++ = *C;
+	}
+	return (int)(Ptr - Dst);
 }
 
-static void ToggleMpvYdl(void)
+static void ShowUserNotification(User* User)
 {
-    gUseMpvYdl = !gUseMpvYdl;
-    if (gUseMpvYdl)
-    {
-        if (IsMpvAndYdlInPath())
-        {
-            gUseLivestreamer = 0;
-        }
-        else
-        {
-            MessageBoxW(NULL, L"Cannot find 'mpv.exe' and 'youtube-dl.exe' in PATH!",
-                TWITCH_NOTIFY_TITLE, MB_ICONEXCLAMATION);
+	WCHAR* Xml = (WCHAR*)State.Buffer;
+	WCHAR* Ptr = Xml;
 
-            gUseMpvYdl = 0;
-        }
-    }
+	DWORD ToastType = 1;
+	if (User->StreamName[0] && User->GameName[0])      ToastType = 4;
+	else if (User->StreamName[0] || User->GameName[0]) ToastType = 2;
+
+	WCHAR ImagePath[MAX_PATH];
+	if (GetFileAttributesW(User->ImagePath) == INVALID_FILE_ATTRIBUTES)
+	{
+		// in case image file is missing, use generic twitch image from our icon
+		DWORD TempLength = GetTempPathW(MAX_PATH, ImagePath);
+		Assert(TempLength);
+		wsprintfW(ImagePath + TempLength, L"twitch.png");
+
+		if (GetFileAttributesW(ImagePath) == INVALID_FILE_ATTRIBUTES)
+		{
+			// extract first icon image data from resources, it is a png file
+			HRSRC Resource = FindResourceW(NULL, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(3)); // 3=RT_ICON
+			if (Resource)
+			{
+				HGLOBAL Global = LoadResource(NULL, Resource);
+				if (Global)
+				{
+					DWORD ResourceSize = SizeofResource(NULL, Resource);
+					LPVOID ResourceData = LockResource(Global);
+					if (ResourceData && ResourceSize)
+					{
+						HANDLE File = CreateFileW(ImagePath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+						if (File != INVALID_HANDLE_VALUE)
+						{
+							DWORD Written;
+							WriteFile(File, ResourceData, ResourceSize, &Written, NULL);
+							CloseHandle(File);
+						}
+					}
+				}
+			}
+		}
+	}
+	else
+	{
+		StrCpyW(ImagePath, User->ImagePath);
+	}
+	for (WCHAR* P = ImagePath; *P; P++)
+	{
+		if (*P == '\\') *P = '/';
+	}
+	Ptr += wsprintfW(Ptr, L"<toast><visual><binding template=\"ToastImageAndText0%u\"><image id=\"1\" src=\"file:///%s\"/>", ToastType, ImagePath);
+	Ptr += wsprintfW(Ptr, L"<text id=\"1\">");
+	Ptr += XmlEscape(Ptr, User->DisplayName);
+	Ptr += wsprintfW(Ptr, L" is live!</text>");
+
+	DWORD Line = 2;
+	if (User->GameName[0])
+	{
+		Ptr += wsprintfW(Ptr, L"<text id=\"%u\">", Line++);
+		Ptr += XmlEscape(Ptr, User->GameName);
+		Ptr += wsprintfW(Ptr, L"</text>");
+	}
+	if (User->StreamName[0])
+	{
+		Ptr += wsprintfW(Ptr, L"<text id=\"%u\">", Line++);
+		Ptr += XmlEscape(Ptr, User->StreamName);
+		Ptr += wsprintfW(Ptr, L"</text>");
+	}
+	Ptr += wsprintfW(Ptr, L"</binding></visual><actions>");
+
+	if (IsMpvInPath())
+	{
+		Ptr += wsprintfW(Ptr, L"<action content=\"Play\" arguments=\"Phttps://www.twitch.tv/%s\"/>", User->Name);
+	}
+	Ptr += wsprintfW(Ptr, L"<action content=\"Open Browser\" arguments=\"Ohttps://www.twitch.tv/%s\"/>", User->Name);
+	Ptr += wsprintfW(Ptr, L"</actions></toast>");
+
+	int XmlLength = (int)(Ptr - Xml);
+	void* Item = WindowsToast_Show(&State.Toast, Xml, XmlLength);
+	WindowsToast_Release(&State.Toast, Item);
 }
 
-static void EditLivestreamerConfig(void)
+static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPARAM LParam)
 {
-    WCHAR path[MAX_PATH];
-    HRESULT hr = SHGetFolderPathW(NULL, CSIDL_APPDATA, NULL, SHGFP_TYPE_CURRENT, path);
-    Assert(SUCCEEDED(hr));
+	if (Message == WM_CREATE)
+	{
+		AddTrayIcon(Window);
+		OnMonitorIniChanges(-1, 0, NULL);
+		State.Quality = GetPrivateProfileIntW(L"player", L"quality", 0, State.IniPath);
+		State.UseMpv = GetPrivateProfileIntW(L"player", L"mpv", 1, State.IniPath);
+		return 0;
+	}
+	else if (Message == WM_DESTROY)
+	{
+		WCHAR Str[2] = { L'0' + State.Quality, 0 };
+		WritePrivateProfileStringW(L"player", L"quality", Str, State.IniPath);
+		WritePrivateProfileStringW(L"player", L"mpv", State.UseMpv ? L"1" : L"0", State.IniPath);
+		RemoveTrayIcon(Window);
+		PostQuitMessage(0);
+		return 0;
+	}
+	else if (Message == WM_TWITCH_NOTIFY_COMMAND)
+	{
+		if (LParam == WM_RBUTTONUP)
+		{
+			HMENU QualityMenu = CreatePopupMenu();
+			Assert(QualityMenu);
 
-    PathAppendW(path, L"livestreamer");
-    if (!PathIsDirectoryW(path) && !CreateDirectoryW(path, NULL))
-    {
-        MessageBoxW(NULL, L"Cannot create livestreamer configuration directory!",
-            TWITCH_NOTIFY_TITLE, MB_ICONERROR);
-    }
-    PathAppendW(path, L"livestreamerrc");
+			for (int Index = 0; Index < ARRAYSIZE(Quality); Index++)
+			{
+				AppendMenuW(QualityMenu, State.Quality == Index ? MF_CHECKED : MF_UNCHECKED, CMD_QUALITY + Index, Quality[Index].Name);
+			}
 
-    ShellExecuteW(NULL, L"open", L"notepad.exe", path, NULL, SW_SHOWNORMAL);
+			HMENU Users = CreatePopupMenu();
+			Assert(Users);
+
+			for (int Index = 0; Index < State.UserCount; Index++)
+			{
+				User* User = &State.Users[Index];
+				if (User->UserId)
+				{
+					AppendMenuW(Users, User->IsOnline ? MF_CHECKED : MF_STRING, CMD_USER + Index, User->DisplayName);
+				}
+			}
+			if (State.UserCount == 0)
+			{
+				AppendMenuW(Users, MF_GRAYED, 0, L"No users");
+			}
+			AppendMenuW(Users, MF_SEPARATOR, 0, NULL);
+			AppendMenuW(Users, MF_STRING, CMD_EDIT_USERS, L"Edit List");
+
+			HMENU Menu = CreatePopupMenu();
+			Assert(Menu);
+
+			AppendMenuW(Menu, MF_STRING, CMD_OPEN_HOMEPAGE, L"Twitch Notify");
+			AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
+			AppendMenuW(Menu, State.UseMpv ? MF_CHECKED : MF_STRING, CMD_USE_MPV, L"Use mpv");
+			AppendMenuW(Menu, MF_POPUP, (UINT_PTR)QualityMenu, L"Quality");
+			AppendMenuW(Menu, MF_POPUP, (UINT_PTR)Users, L"Users");
+
+			AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
+			AppendMenuW(Menu, MF_STRING, CMD_EXIT, L"Exit");
+
+			POINT Mouse;
+			GetCursorPos(&Mouse);
+
+			SetForegroundWindow(Window);
+			int Command = TrackPopupMenu(Menu, TPM_RETURNCMD | TPM_NONOTIFY, Mouse.x, Mouse.y, 0, Window, NULL);
+			if (Command == CMD_OPEN_HOMEPAGE)
+			{
+				ShellExecuteW(NULL, L"open", TWITCH_NOTIFY_HOMEPAGE, NULL, NULL, SW_SHOWNORMAL);
+			}
+			else if (Command == CMD_USE_MPV)
+			{
+				State.UseMpv = !State.UseMpv;
+			}
+			else if (Command >= CMD_QUALITY && Command < CMD_QUALITY + ARRAYSIZE(Quality))
+			{
+				State.Quality = Command - CMD_QUALITY;
+			}
+			else if (Command == CMD_EDIT_USERS)
+			{
+				ShellExecuteW(NULL, L"edit", State.IniPath, NULL, NULL, SW_SHOWNORMAL);
+			}
+			else if (Command == CMD_EXIT)
+			{
+				DestroyWindow(Window);
+			}
+			else if (Command >= CMD_USER && Command < CMD_USER + State.UserCount)
+			{
+				User* User = &State.Users[Command - CMD_USER];
+
+				WCHAR Url[1024];
+				wsprintfW(Url, L"https://www.twitch.tv/%s", User->Name);
+
+				if (State.UseMpv && IsMpvInPath() && User->IsOnline)
+				{
+					OpenMpvUrl(Url);
+				}
+				else
+				{
+					ShellExecuteW(NULL, L"open", Url, NULL, NULL, SW_SHOWNORMAL);
+				}
+			}
+
+			DestroyMenu(Menu);
+			DestroyMenu(Users);
+			DestroyMenu(QualityMenu);
+		}
+		return 0;
+	}
+	else if (Message == WM_TWITCH_NOTIFY_ALREADY_RUNNING)
+	{
+		ShowTrayMessage(Window, NIIF_INFO, TWITCH_NOTIFY_NAME" is already running");
+		return 0;
+	}
+	else if (Message == WM_TWITCH_NOTIFY_TRAY_ICON)
+	{
+		UpdateTrayIcon(Window, State.Icon[WParam]);
+		return 0;
+	}
+ 	else if (Message == WM_TIMER)
+	{
+		if (WParam == TIMER_RELOAD_USERS)
+		{
+			SetEvent(State.ReloadEvent);
+			KillTimer(Window, TIMER_RELOAD_USERS);
+			if (State.Websocket)
+			{
+				WinHttpWebSocketClose(State.Websocket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
+			}
+			return 0;
+		}
+		else if (WParam == TIMER_WEBSOCKET_PING)
+		{
+			char Data[] = "{\"type\":\"PING\"}";
+			WinHttpWebSocketSend(State.Websocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, Data, sizeof(Data) - 1);
+			return 0;
+		}
+	}
+	else if (WM_TASKBARCREATED && Message == WM_TASKBARCREATED)
+	{
+		AddTrayIcon(Window);
+		return 0;
+	}
+
+	return DefWindowProcW(Window, Message, WParam, LParam);
 }
 
-static void EditConfigFile(void)
+static void LoadUsers(void)
 {
-    WCHAR path[MAX_PATH];
-    StrCpyNW(path, gExeFolder, _countof(path));
-    PathAppendW(path, TWITCH_NOTIFY_CONFIG);
+	WIN32_FILE_ATTRIBUTE_DATA Data;
+	if (!GetFileAttributesExW(State.IniPath, GetFileExInfoStandard, &Data))
+	{
+		// ini file deleted?
+		return;
+	}
 
-    ShellExecuteW(NULL, L"open", L"notepad.exe", path, NULL, SW_SHOWNORMAL);
-}
+	if (CompareFileTime(&State.LastIniWriteTime, &Data.ftLastWriteTime) >= 0)
+	{
+		// ini file is up to date
+		return;
+	}
 
-static void AddTrayIcon(HWND window)
-{
-    NOTIFYICONDATAW data =
-    {
-        .cbSize = sizeof(data),
-        .hWnd = window,
-        .uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP,
-        .uCallbackMessage = WM_TWITCH_NOTIFY_COMMAND,
-        .hIcon = gTwitchNotifyIcon,
-    };
-    Assert(data.hIcon);
-    StrCpyNW(data.szTip, TWITCH_NOTIFY_TITLE, _countof(data.szTip));
+	State.LastIniWriteTime = Data.ftLastWriteTime;
 
-    BOOL ret = Shell_NotifyIconW(NIM_ADD, &data);
-    Assert(ret);
-}
+	WCHAR Users[32768];
+	Users[0] = 0;
+	GetPrivateProfileSectionW(L"users", Users, ARRAYSIZE(Users), State.IniPath);
 
-static void OpenHomePage(void)
-{
-    ShellExecuteW(NULL, L"open", L"https://github.com/mmozeiko/TwitchNotify/", NULL, NULL, SW_SHOWNORMAL);
-}
+	WCHAR* Ptr = Users;
 
-static LRESULT CALLBACK WindowProc(HWND window, UINT msg, WPARAM wparam, LPARAM lparam)
-{
-    switch (msg)
-    {
-        case WM_CREATE:
-        {
-            WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
-            Assert(WM_TASKBARCREATED);
+	int Count = 0;
+	while (*Ptr != 0)
+	{
+		if (Count == MAX_USER_COUNT)
+		{
+			ShowTrayMessage(State.Window, NIIF_WARNING, L"More than 50 users is not supported");
+			break;
+		}
+		User* User = &State.Users[Count];
+		User->UserId = 0;
 
-            AddTrayIcon(window);
-            ToggleActive(window);
-            SetEvent(gConfigEvent);
-            return 0;
-        }
-
-        case WM_DESTROY:
-        {
-            NOTIFYICONDATAW data =
-            {
-                .cbSize = sizeof(data),
-                .hWnd = window,
-            };
-            BOOL ret = Shell_NotifyIconW(NIM_DELETE, &data);
-            Assert(ret);
-
-            PostQuitMessage(0);
-            return 0;
-        }
-
-        case WM_POWERBROADCAST:
-        {
-            if (wparam == PBT_APMRESUMEAUTOMATIC)
-            {
-                if (gActive)
-                {
-                    ToggleActive(window);
-                    ToggleActive(window);
-                }
-            }
-            return 0;
-        }
-
-        case WM_TWITCH_NOTIFY_COMMAND:
-        {
-            if (lparam == WM_RBUTTONUP)
-            {
-                HMENU mpvYdl = CreatePopupMenu();
-                Assert(mpvYdl);
-
-                AppendMenuW(mpvYdl, gYdlFormat == 0 ? MF_CHECKED : MF_UNCHECKED, CMD_YDL_FORMAT_SOURCE, L"Source");
-                AppendMenuW(mpvYdl, gYdlFormat == 1 ? MF_CHECKED : MF_UNCHECKED, CMD_YDL_FORMAT_HIGH, L"High (1280x720)");
-                AppendMenuW(mpvYdl, gYdlFormat == 2 ? MF_CHECKED : MF_UNCHECKED, CMD_YDL_FORMAT_MEDIUM, L"Medium (852x480)");
-                AppendMenuW(mpvYdl, gYdlFormat == 3 ? MF_CHECKED : MF_UNCHECKED, CMD_YDL_FORMAT_LOW, L"Low (640x360)");
-                AppendMenuW(mpvYdl, gYdlFormat == 4 ? MF_CHECKED : MF_UNCHECKED, CMD_YDL_FORMAT_MOBILE, L"Mobile (400x226)");
-
-                HMENU settings = CreatePopupMenu();
-                Assert(settings);
-
-                AppendMenuW(settings, gUseLivestreamer ? MF_CHECKED : MF_UNCHECKED, CMD_USE_LIVESTREAMER, L"Use livestreamer");
-                AppendMenuW(settings, gUseLivestreamer ? MF_STRING : MF_GRAYED, CMD_EDIT_LIVESTREAMERRC, L"Edit livestreamerrc file");
-                AppendMenuW(settings, MF_SEPARATOR, 0, NULL);
-                AppendMenuW(settings, gUseMpvYdl ? MF_CHECKED : MF_UNCHECKED, CMD_USE_MPV_YDL, L"Use mpv && youtube-dl");
-                AppendMenuW(settings, (gUseMpvYdl ? 0 : MF_GRAYED) | MF_POPUP, (UINT_PTR)mpvYdl, L"youtube-dl format");
-
-                HMENU users = CreatePopupMenu();
-                Assert(users);
-
-                for (int i = 0; i < gUserCount; i++)
-                {
-                    AppendMenuW(users, gUsers[i].online ? MF_CHECKED : MF_STRING, (i + 1) << 8, gUsers[i].name);
-                }
-
-                HMENU menu = CreatePopupMenu();
-                Assert(menu);
-
-#ifdef TWITCH_NOTIFY_VERSION
-                AppendMenuW(menu, MF_STRING, CMD_OPEN_HOMEPAGE, L"Twitch Notify (" TWITCH_NOTIFY_VERSION ")");
-#else
-                AppendMenuW(menu, MF_STRING, CMD_OPEN_HOMEPAGE, L"Twitch Notify");
-#endif
-                AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-                AppendMenuW(menu, gActive ? MF_CHECKED : MF_UNCHECKED, CMD_TOGGLE_ACTIVE, L"Active");
-                AppendMenuW(menu, MF_POPUP, (UINT_PTR)settings, L"Settings");
-
-                AppendMenuW(menu, MF_STRING, CMD_EDIT_CONFIG_FILE, L"Modify user list");
-
-                if (gUserCount == 0)
-                {
-                    AppendMenuW(menu, MF_GRAYED, 0, L"No users found");
-                }
-                else
-                {
-                    AppendMenuW(menu, MF_POPUP, (UINT_PTR)users, L"Users");
-                }
-
-                AppendMenuW(menu, MF_SEPARATOR, 0, NULL);
-                AppendMenuW(menu, MF_STRING, CMD_QUIT, L"Exit");
-
-                POINT mouse;
-                GetCursorPos(&mouse);
-
-                SetForegroundWindow(window);
-                int cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, mouse.x, mouse.y, 0, window, NULL);
-                switch (cmd)
-                {
-                case CMD_OPEN_HOMEPAGE:
-                    OpenHomePage();
-                    break;
-                case CMD_TOGGLE_ACTIVE:
-                    ToggleActive(window);
-                    break;
-                case CMD_USE_LIVESTREAMER:
-                    ToggleLivestreamer();
-                    break;
-                case CMD_EDIT_LIVESTREAMERRC:
-                    EditLivestreamerConfig();
-                    break;
-                case CMD_USE_MPV_YDL:
-                    ToggleMpvYdl();
-                    break;
-                case CMD_YDL_FORMAT_SOURCE:
-                case CMD_YDL_FORMAT_HIGH:
-                case CMD_YDL_FORMAT_MEDIUM:
-                case CMD_YDL_FORMAT_LOW:
-                case CMD_YDL_FORMAT_MOBILE:
-                    gYdlFormat = cmd - CMD_YDL_FORMAT_SOURCE;
-                    break;
-                case CMD_EDIT_CONFIG_FILE:
-                    EditConfigFile();
-                    break;
-                case CMD_QUIT:
-                    DestroyWindow(window);
-                    break;
-                default:
-                    OpenTwitchUser((cmd >> 8) - 1);
-                    break;
-                }
-
-                DestroyMenu(menu);
-                DestroyMenu(users);
-                DestroyMenu(settings);
-                DestroyMenu(mpvYdl);
-            }
-            else if (lparam == NIN_BALLOONUSERCLICK)
-            {
-                if (gLastPopupUserIndex != -1)
-                {
-                    OpenTwitchUser(gLastPopupUserIndex);
-                    gLastPopupUserIndex = -1;
-                }
-            }
-            else if (lparam == WM_LBUTTONDBLCLK)
-            {
-                OpenHomePage();
-            }
-            break;
-        }
-
-        case WM_TWITCH_NOTIFY_REMOVE_USERS:
-        {
-            gUserCount = 0;
-            return 0;
-        }
-        
-        case WM_TWITCH_NOTIFY_ADD_USER:
-        {
-            if (gUserCount < _countof(gUsers))
-            {
-                struct User* user = gUsers + gUserCount++;
-                StrCpyNW(user->name, (PCWSTR)wparam, _countof(user->name));
-                user->online = 0;
-            }
-            return 0;
-        }
-
-        case WM_TWITCH_NOTIFY_START_UPDATE:
-        {
-            for (int i = 0; i < gUserCount; i++)
-            {
-                gUsers[i].online = -gUsers[i].online;
-            }
-            return 0;
-        }
-
-        case WM_TWITCH_NOTIFY_USER_ONLINE:
-        {
-            struct UserStatusOnline* status = (void*)wparam;
-
-            for (int i = 0; i < gUserCount; i++)
-            {
-                struct User* user = gUsers + i;
-                if (StrCmpW(user->name, status->user) == 0)
-                {
-                    if (user->online == 0)
-                    {
-                        gLastPopupUserIndex = i;
-                        ShowUserOnlineNotification(status);
-                    }
-                    user->online = 1;
-                    break;
-                }
-            }
-
-            if (status->icon)
-            {
-                DestroyIcon(status->icon);
-            }
-            return 0;
-        }
-
-        case WM_TWITCH_NOTIFY_END_UPDATE:
-        {
-            for (int i = 0; i < gUserCount; i++)
-            {
-                // -1 means user was online, now is offline
-                //  0 means user was and now is offline
-                // +1 means user now is online
-                gUsers[i].online = gUsers[i].online > 0;
-            }
-            return 0;
-        }
-
-        case WM_TWITCH_NOTIFY_UPDATE_ERROR:
-        {
-            gLastPopupUserIndex = -1;
-            ShowNotification((LPWSTR)wparam, (LPWSTR)lparam, NIIF_ERROR, NULL);
-            return 0;
-        }
-
-        case WM_TWITCH_NOTIFY_ALREADY_RUNNING:
-        {
-            gLastPopupUserIndex = -1;
-            ShowNotification(TWITCH_NOTIFY_TITLE L" is already running!", NULL, NIIF_INFO, NULL);
-            return 0;
-        }
-
-        case WM_TIMER:
-        {
-            if (wparam == UPDATE_USERS_TIMER_ID)
-            {
-                SetEvent(gUpdateEvent);
-            }
-            else if (wparam == RELOAD_CONFIG_TIMER_ID)
-            {
-                SetEvent(gConfigEvent);
-                KillTimer(window, RELOAD_CONFIG_TIMER_ID);
-            }
-            return 0;
-        }
-
-        default:
-            if (WM_TASKBARCREATED && msg == WM_TASKBARCREATED)
-            {
-                AddTrayIcon(window);
-                return 0;
-            }
-            break;
-    }
-
-    return DefWindowProcW(window, msg, wparam, lparam);
-}
-
-static int DownloadURL(WCHAR* url, WCHAR* headers, char* data, DWORD* dataLength)
-{
-    DWORD flags = INTERNET_FLAG_EXISTING_CONNECT | INTERNET_FLAG_KEEP_CONNECTION |
-        INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_SECURE;
-    HINTERNET connection = InternetOpenUrlW(gInternet, url, headers, (DWORD)-1, flags, 0);
-    if (!connection)
-    {
-        return 0;
-    }
-
-    DWORD downloaded = 0;
-    DWORD available = *dataLength;
-    int result = 1;
-    for (;;)
-    {
-        DWORD read;
-        if (InternetReadFile(connection, data + downloaded, available, &read))
-        {
-            if (read == 0)
-            {
-                break;
-            }
-            downloaded += read;
-        }
-        else
-        {
-            result = read == 0;
-            break;
-        }
-    }
-    InternetCloseHandle(connection);
-    *dataLength = downloaded;
-    return result;
+		WCHAR* Name = Ptr;
+		StrTrimW(Name, L" \t");
+		if (Name[0])
+		{
+			StrCpyNW(User->Name, Name, MAX_STRING_LENGTH);
+			Count++;
+		}
+		Ptr += lstrlenW(Ptr) + 1;
+	}
+	State.UserCount = Count;
 }
 
 // http://www.isthe.com/chongo/tech/comp/fnv/
-static UINT64 GetFnv1Hash(BYTE* bytes, size_t size)
+static UINT64 GetFnv1Hash(const void* Ptr, int Size)
 {
-    UINT64 hash = 14695981039346656037ULL;
-    for (size_t i = 0; i < size; i++)
-    {
-        hash *= 1099511628211ULL;
-        hash ^= bytes[i];
-    }
-    return hash;
+	const BYTE* Bytes = Ptr;
+	UINT64 Hash = 14695981039346656037ULL;
+	for (int Index = 0; Index < Size; Index++)
+	{
+		Hash *= 1099511628211ULL;
+		Hash ^= Bytes[Index];
+	}
+	return Hash;
 }
 
-static int GetUserIconCachePath(WCHAR* path, DWORD size, UINT64 hash)
+static void DownloadUserImage(LPWSTR ImagePath, LPCWSTR ImageUrl)
 {
-    DWORD length = GetTempPathW(size, path);
-    if (length)
-    {
-        wnsprintfW(path + length, size - length, L"%016I64x.ico", hash);
-        return 1;
-    }
-    return 0;
+	DWORD ImageUrlLength = lstrlenW(ImageUrl);
+	UINT64 Hash = GetFnv1Hash(ImageUrl, ImageUrlLength * sizeof(WCHAR));
+
+	DWORD TempLength = GetTempPathW(MAX_PATH, ImagePath);
+	Assert(TempLength);
+
+	LPWSTR Extension = StrRChrW(ImageUrl, ImageUrl + ImageUrlLength, L'.');
+	wsprintfW(ImagePath + TempLength, L"%08x%08x%s", (DWORD)(Hash >> 32), (DWORD)Hash, Extension);
+
+	WIN32_FILE_ATTRIBUTE_DATA Data;
+	if (GetFileAttributesExW(ImagePath, GetFileExInfoStandard, &Data))
+	{
+		UINT64 LastWrite = (((UINT64)Data.ftLastWriteTime.dwHighDateTime) << 32) + Data.ftLastWriteTime.dwLowDateTime;
+
+		FILETIME NowTime;
+		GetSystemTimeAsFileTime(&NowTime);
+
+		UINT64 Now = (((UINT64)NowTime.dwHighDateTime) << 32) + NowTime.dwLowDateTime;
+		UINT64 Expires = LastWrite + (UINT64)MAX_IMAGE_CACHE_AGE * 10 * 1000 * 1000;
+		if (Now < Expires)
+		{
+			// ok image up to date
+			return;
+		}
+	}
+
+	// download image
+
+	WCHAR HostName[MAX_PATH];
+	WCHAR UrlPath[MAX_PATH];
+
+	URL_COMPONENTSW Url =
+	{
+		.dwStructSize = sizeof(Url),
+		.lpszHostName = HostName,
+		.lpszUrlPath = UrlPath,
+		.dwHostNameLength = ARRAYSIZE(HostName),
+		.dwUrlPathLength = ARRAYSIZE(UrlPath),
+	};
+
+	if (!WinHttpCrackUrl(ImageUrl, ImageUrlLength, 0, &Url))
+	{
+		// bad image url
+		return;
+	}
+
+	HINTERNET Connection = WinHttpConnect(State.Session, HostName, Url.nPort, 0);
+	if (Connection)
+	{
+		HINTERNET Request = WinHttpOpenRequest(Connection, L"GET", UrlPath, NULL, NULL, NULL, Url.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+		if (Request)
+		{
+			if (WinHttpSendRequest(Request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(Request, NULL))
+			{
+				DWORD Status = 0;
+				DWORD StatusSize = sizeof(Status);
+				WinHttpQueryHeaders(Request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &Status, &StatusSize, WINHTTP_NO_HEADER_INDEX);
+
+				if (Status == HTTP_STATUS_OK)
+				{
+					HANDLE File = CreateFileW(ImagePath, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+					if (File != INVALID_HANDLE_VALUE)
+					{
+						for (;;)
+						{
+							DWORD Read;
+							if (!WinHttpReadData(Request, State.Buffer, MAX_BUFFER_SIZE, &Read))
+							{
+								break;
+							}
+							if (Read == 0)
+							{
+								break;
+							}
+							DWORD Written;
+							WriteFile(File, State.Buffer, Read, &Written, NULL);
+						}
+						CloseHandle(File);
+					}
+				}
+				WinHttpCloseHandle(Request);
+			}
+			WinHttpCloseHandle(Connection);
+		}
+	}
 }
 
-static void SaveIconToCache(UINT64 hash, UINT width, UINT height, BYTE* pixels)
+static DWORD SendGqlQuery(char* Query, DWORD QuerySize)
 {
-    WCHAR path[MAX_PATH];
-    if (!GetUserIconCachePath(path, _countof(path), hash))
-    {
-        return;
-    }
+	DWORD ReadSize = 0;
 
-    DWORD size = width * height * 4;
+	HINTERNET Connection = WinHttpConnect(State.Session, L"gql.twitch.tv", INTERNET_DEFAULT_HTTPS_PORT, 0);
+	if (Connection)
+	{
+		HINTERNET Request = WinHttpOpenRequest(Connection, L"POST", L"/gql", NULL, NULL, NULL, WINHTTP_FLAG_SECURE);
+		if (Request)
+		{
+			WCHAR Headers[] = L"Client-ID: kimne78kx3ncx6brgo4mv6wki5h1ko";
+			if (WinHttpSendRequest(Request, Headers, ARRAYSIZE(Headers) - 1, Query, QuerySize, QuerySize, 0) && WinHttpReceiveResponse(Request, NULL))
+			{
+				DWORD Status = 0;
+				DWORD StatusSize = sizeof(Status);
+				WinHttpQueryHeaders(Request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &Status, &StatusSize, WINHTTP_NO_HEADER_INDEX);
 
-    struct ICONDIR
-    {
-        WORD idReserved;
-        WORD  idType;
-        WORD idCount;
-    } dir = {
-        .idType = 1,
-        .idCount = 1,
-    };
+				if (Status == HTTP_STATUS_OK)
+				{
+					for (;;)
+					{
+						DWORD Read;
+						if (!WinHttpReadData(Request, State.Buffer + ReadSize, MAX_BUFFER_SIZE - ReadSize, &Read))
+						{
+							break;
+						}
+						if (Read == 0)
+						{
+							break;
+						}
+						ReadSize += Read;
+					}
+				}
+			}
+			WinHttpCloseHandle(Request);
+		}
+		WinHttpCloseHandle(Connection);
+	}
 
-    struct ICONDIRENTRY
-    {
-        BYTE bWidth;
-        BYTE bHeight;
-        BYTE bColorCount;
-        BYTE bReserved;
-        WORD wPlanes;
-        WORD wBitCount;
-        DWORD dwBytesInRes;
-        DWORD dwImageOffset;
-    } entry = {
-        .bWidth = (BYTE)(width == MAX_WINDOWS_ICON_SIZE ? 0 : width),
-        .bHeight = (BYTE)(height == MAX_WINDOWS_ICON_SIZE ? 0 : height),
-        .wPlanes = 1,
-        .wBitCount = 32,
-        .dwBytesInRes = sizeof(BITMAPINFOHEADER) + size + size/32,
-        .dwImageOffset = sizeof(dir) + sizeof(entry),
-    };
-
-    BITMAPINFOHEADER bmp =
-    {
-        .biSize = sizeof(bmp),
-        .biWidth = width,
-        .biHeight = 2 * height,
-        .biPlanes = 1,
-        .biBitCount = 32,
-        .biSizeImage = size + size / 32,
-    };
-
-    for (UINT y = 0; y < height / 2; y++)
-    {
-        DWORD* row0 = (DWORD*)(pixels + y * width * 4);
-        DWORD* row1 = (DWORD*)(pixels + (height - 1 - y) * width * 4);
-        for (UINT x = 0; x < width; x++)
-        {
-            DWORD tmp = *row0;
-            *row0++ = *row1;
-            *row1++ = tmp;
-        }
-    }
-
-    HANDLE file = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (file != INVALID_HANDLE_VALUE)
-    {
-        DWORD written;
-        WriteFile(file, &dir, sizeof(dir), &written, NULL);
-        WriteFile(file, &entry, sizeof(entry), &written, NULL);
-        WriteFile(file, &bmp, sizeof(bmp), &written, NULL);
-        WriteFile(file, pixels, size, &written, NULL);
-        SetFilePointer(file, size / 32, NULL, FILE_CURRENT); // and-mask, 1bpp
-        SetEndOfFile(file);
-        CloseHandle(file);
-    }
+	return ReadSize;
 }
 
-static HICON DecodeIconAndSaveToCache(UINT64 hash, void* data, DWORD length)
+static void DownloadUserList(void)
 {
-    if (!gWicFactory)
-    {
-        return NULL;
-    }
+	char* Query = State.Buffer;
 
-    IStream* stream = SHCreateMemStream(data, length);
-    if (!stream)
-    {
-        return NULL;
-    }
+	char* Ptr = Query;
+	{
+		Ptr += wsprintfA(Ptr, "{\"query\":\"{users(logins:[");
+		for (int UserIndex = 0; UserIndex < State.UserCount; UserIndex++)
+		{
+			Ptr += wsprintfA(Ptr, "%s\\\"%S\\\"", UserIndex ? "," : "", State.Users[UserIndex].Name);
+		}
+		// allowed image widths: 28, 50, 70, 150, 300, 600
+		Ptr += wsprintfA(Ptr, "]){id,displayName,profileImageURL(width:300),stream{title,game{displayName}}}}\"}");
+	}
+	DWORD QuerySize = (DWORD)(Ptr - Query);
 
-    HICON icon = NULL;
-    HRESULT hr;
+	DWORD ReadSize = SendGqlQuery(Query, QuerySize);
+	if (ReadSize == 0)
+	{
+		ShowTrayMessage(State.Window, NIIF_ERROR, L"Failed to download user list from Twitch");
+		return;
+	}
 
-    IWICBitmapDecoder* decoder;
-    hr = IWICImagingFactory_CreateDecoderFromStream(gWicFactory, stream, NULL, WICDecodeMetadataCacheOnDemand,
-        &decoder);
-    if (SUCCEEDED(hr))
-    {
-        IWICBitmapFrameDecode* frame;
-        hr = IWICBitmapDecoder_GetFrame(decoder, 0, &frame);
-        if (SUCCEEDED(hr))
-        {
-            IWICFormatConverter* bitmap;
-            hr = IWICImagingFactory_CreateFormatConverter(gWicFactory, &bitmap);
-            if (SUCCEEDED(hr))
-            {
-                hr = IWICFormatConverter_Initialize(bitmap, (IWICBitmapSource*)frame,
-                    &GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, NULL, 0., WICBitmapPaletteTypeCustom);
-                if (SUCCEEDED(hr))
-                {
-                    UINT w, h;
-                    if (SUCCEEDED(IWICBitmapFrameDecode_GetSize(bitmap, &w, &h)))
-                    {
-                        IWICBitmapSource* source = NULL;
+	JsonObject* Json = JsonObject_Parse(State.Buffer, ReadSize);
+	JsonArray* Errors = JsonObject_GetArray(Json, JsonCSTR("errors"));
+	if (Errors)
+	{
+		JsonObject* ErrorMessage = JsonArray_GetObject(Errors, 0);
+		LPCWSTR Message = JsonObject_GetString(ErrorMessage, JsonCSTR("message"));
+		ShowTrayMessage(State.Window, NIIF_ERROR, Message);
+		JsonRelease(ErrorMessage);
+		JsonRelease(Errors);
+		JsonRelease(Json);
+		return;
+	}
 
-                        if (w > MAX_WINDOWS_ICON_SIZE || h > MAX_WINDOWS_ICON_SIZE)
-                        {
-                            if (w > MAX_WINDOWS_ICON_SIZE)
-                            {
-                                h = h * MAX_WINDOWS_ICON_SIZE / w;
-                                w = MAX_WINDOWS_ICON_SIZE;
-                            }
-                            if (h > MAX_WINDOWS_ICON_SIZE)
-                            {
-                                h = MAX_WINDOWS_ICON_SIZE;
-                                w = w * MAX_WINDOWS_ICON_SIZE / h;
-                            }
+	JsonObject* Data = JsonObject_GetObject(Json, JsonCSTR("data"));
+	JsonArray* Users = JsonObject_GetArray(Data, JsonCSTR("users"));
 
-                            IWICBitmapScaler* scaler;
-                            hr = IWICImagingFactory_CreateBitmapScaler(gWicFactory, &scaler);
-                            if (SUCCEEDED(hr))
-                            {
-                                hr = IWICBitmapScaler_Initialize(scaler, (IWICBitmapSource*)bitmap, w, h,
-                                    WICBitmapInterpolationModeCubic);
-                                if (SUCCEEDED(hr))
-                                {
-                                    hr = IWICBitmapScaler_QueryInterface(scaler, &IID_IWICBitmapSource, &source);
-                                }
-                                IWICBitmapScaler_Release(scaler);
-                            }
-                        }
-                        else
-                        {
-                            hr = IWICBitmapScaler_QueryInterface(bitmap, &IID_IWICBitmapSource, &source);
-                        }
+	UINT32 UsersCount = JsonArray_GetCount(Users);
+	for (UINT32 Index = 0; Index < UsersCount; Index++)
+	{
+		User* User = &State.Users[Index];
 
-                        if (SUCCEEDED(hr))
-                        {
-                            Assert(source);
-                            Assert(w <= MAX_WINDOWS_ICON_SIZE && h <= MAX_WINDOWS_ICON_SIZE);
+		JsonObject* UserData = JsonArray_GetObject(Users, Index);
+		if (UserData == NULL)
+		{
+			// user does not exist
+			User->UserId = 0;
+		}
+		else
+		{
+			LPCWSTR Id = JsonObject_GetString(UserData, JsonCSTR("id"));
+			LPCWSTR ProfileImageUrl = JsonObject_GetString(UserData, JsonCSTR("profileImageURL"));
+			LPCWSTR DisplayName = JsonObject_GetString(UserData, JsonCSTR("displayName"));
 
-                            DWORD stride = w * 4;
-                            DWORD size = w * h * 4;
-                            BYTE pixels[MAX_WINDOWS_ICON_SIZE * MAX_WINDOWS_ICON_SIZE * 4];
-                            if (SUCCEEDED(IWICBitmapFrameDecode_CopyPixels(source, NULL, stride, size, pixels)))
-                            {
-                                icon = CreateIcon(NULL, w, h, 1, 32, NULL, pixels);
-                                SaveIconToCache(hash, w, h, pixels);
-                            }
-                            IWICBitmapSource_Release(source);
-                        }
-                    }
-                }
-                IWICFormatConverter_Release(bitmap);
-            }
-            IWICBitmapFrameDecode_Release(frame);
-        }
-        IWICBitmapFrameDecode_Release(decoder);
-    }
-    IStream_Release(stream);
+			StrCpyNW(User->DisplayName, DisplayName ? DisplayName : User->Name, MAX_STRING_LENGTH);
+			DownloadUserImage(User->ImagePath, ProfileImageUrl);
+			User->UserId = StrToIntW(Id);
 
-    return icon;
+			JsonObject* Stream = JsonObject_GetObject(UserData, JsonCSTR("stream"));
+			if (Stream)
+			{
+				LPCWSTR StreamName = JsonObject_GetString(Stream, JsonCSTR("title"));
+				StrCpyNW(User->StreamName, StreamName ? StreamName : L"", MAX_STRING_LENGTH);
+
+				JsonObject* Game = JsonObject_GetObject(Stream, JsonCSTR("game"));
+				LPCWSTR GameName = JsonObject_GetString(Game, JsonCSTR("displayName"));
+				StrCpyNW(User->GameName, GameName ? GameName : L"", MAX_STRING_LENGTH);
+
+				User->IsOnline = TRUE;
+
+				JsonRelease(Game);
+				JsonRelease(Stream);
+			}
+			else
+			{
+				User->IsOnline = FALSE;
+			}
+
+			JsonRelease(UserData);
+		}
+	}
+	JsonRelease(Users);
+	JsonRelease(Data);
+	JsonRelease(Json);
 }
 
-static HICON LoadUserIconFromCache(UINT64 hash)
+static void ProcessUserOnline(UINT UserId)
 {
-    WCHAR path[MAX_PATH];
-    if (!GetUserIconCachePath(path, _countof(path), hash))
-    {
-        return NULL;
-    }
+	for (int Index = 0; Index < State.UserCount; Index++)
+	{
+		User* User = &State.Users[Index];
+		if (User->UserId == UserId)
+		{
+			char* Query = State.Buffer;
+			int QuerySize = wsprintfA(Query, "{\"query\":\"{users(ids:[%u]){stream{title,game{displayName}}}}\"}", UserId);
+			DWORD ReadSize = SendGqlQuery(Query, QuerySize);
+			if (ReadSize != 0)
+			{
+				JsonObject* Json = JsonObject_Parse(State.Buffer, ReadSize);
+				JsonObject* Data = JsonObject_GetObject(Json, JsonCSTR("data"));
+				JsonArray* Users = JsonObject_GetArray(Data, JsonCSTR("users"));
+				JsonObject* UserData = JsonArray_GetObject(Users, 0);
+				JsonObject* Stream = JsonObject_GetObject(UserData, JsonCSTR("stream"));
+				if (Stream)
+				{
+					LPCWSTR StreamName = JsonObject_GetString(Stream, JsonCSTR("title"));
+					StrCpyNW(User->StreamName, StreamName ? StreamName : L"", MAX_STRING_LENGTH);
 
-    WIN32_FILE_ATTRIBUTE_DATA data;
-    if (GetFileAttributesExW(path, GetFileExInfoStandard, &data))
-    {
-        UINT64 lastWrite = (((UINT64)data.ftLastWriteTime.dwHighDateTime) << 32) +
-            data.ftLastWriteTime.dwLowDateTime;
+					JsonObject* Game = JsonObject_GetObject(Stream, JsonCSTR("stream"));
+					LPCWSTR GameName = JsonObject_GetString(Game, JsonCSTR("displayName"));
+					StrCpyNW(User->GameName, GameName ? GameName : L"", MAX_STRING_LENGTH);
 
-        FILETIME nowTime;
-        GetSystemTimeAsFileTime(&nowTime);
+					ShowUserNotification(User);
 
-        UINT64 now = (((UINT64)nowTime.dwHighDateTime) << 32) + nowTime.dwLowDateTime;
-        UINT64 expires = lastWrite + (UINT64)MAX_ICON_CACHE_AGE * 10 * 1000 * 1000;
-        if (expires < now)
-        {
-            return NULL;
-        }
-        return LoadImageW(NULL, path, IMAGE_ICON, 0, 0, LR_LOADFROMFILE);
-    }
+					JsonRelease(Game);
+					JsonRelease(Stream);
+				}
+				JsonRelease(UserData);
+				JsonRelease(Users);
+				JsonRelease(Data);
+				JsonRelease(Json);
+			}
 
-    return NULL;
+			User->IsOnline = TRUE;
+
+			return;
+		}
+	}
 }
 
-static HICON GetUserIcon(WCHAR* url, int urlLength, char* downloadBuffer)
+static void ProcessUserOffline(UINT UserId)
 {
-    UINT64 hash = GetFnv1Hash((BYTE*)url, urlLength * sizeof(WCHAR));
-    HICON icon = LoadUserIconFromCache(hash);
-    if (icon)
-    {
-        return icon;
-    }
-
-    DWORD dataLength = MAX_DOWNLOAD_SIZE;
-    if (DownloadURL(url, NULL, downloadBuffer, &dataLength))
-    {
-        icon = DecodeIconAndSaveToCache(hash, downloadBuffer, dataLength);
-    }
-    return icon;
+	for (int Index = 0; Index < State.UserCount; Index++)
+	{
+		if (State.Users[Index].UserId == UserId)
+		{
+			State.Users[Index].IsOnline = FALSE;
+			return;
+		}
+	}
 }
 
-static int jsoneq(const char* json, jsmntok_t* token, const char* str)
+static void ConnectWebsocket(void)
 {
-    if (token->type != JSMN_STRING)
-    {
-        return 0;
-    }
+	HINTERNET Connection = WinHttpConnect(State.Session, L"pubsub-edge.twitch.tv", INTERNET_DEFAULT_HTTPS_PORT, 0);
+	if (!Connection)
+	{
+		return;
+	}
 
-    const char* ptr = json + token->start;
-    int length = token->end - token->start;
-    while (*str)
-    {
-        if (length == 0 || *ptr++ != *str++)
-        {
-            return 0;
-        }
-        length--;
-    }
-    return length == 0;
+	HINTERNET Request = WinHttpOpenRequest(Connection, L"GET", L"/v1", NULL, NULL, NULL, WINHTTP_FLAG_SECURE);
+	if (!Request)
+	{
+		WinHttpCloseHandle(Connection);
+		return;
+	}
+
+	WinHttpSetOption(Request, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0);
+	if (!WinHttpSendRequest(Request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) || !WinHttpReceiveResponse(Request, 0))
+	{
+		WinHttpCloseHandle(Request);
+		WinHttpCloseHandle(Connection);
+		return;
+	}
+
+	HINTERNET Websocket = WinHttpWebSocketCompleteUpgrade(Request, 0);
+	WinHttpCloseHandle(Request);
+	if (!Websocket)
+	{
+		WinHttpCloseHandle(Connection);
+		return;
+	}
+
+	State.Websocket = Websocket;
+
+	DWORD Error;
+
+	for (int Index = 0; Index < State.UserCount; Index++)
+	{
+		UINT UserId = State.Users[Index].UserId;
+
+		if (UserId)
+		{
+			char Data[1024];
+			int DataLength = wsprintfA(Data, "{\"type\":\"LISTEN\",\"data\":{\"topics\":[\"video-playback-by-id.%u\"]}}", UserId);
+
+			Error = WinHttpWebSocketSend(Websocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, Data, DataLength);
+			if (Error != NO_ERROR)
+			{
+				break;
+			}
+		}
+	}
+
+	if (Error == NO_ERROR)
+	{
+		DWORD BufferSize = 0;
+
+		PostMessageW(State.Window, WM_TWITCH_NOTIFY_TRAY_ICON, 0, 0);
+		SetTimer(State.Window, TIMER_WEBSOCKET_PING, TIMER_WEBSOCKET_PING_INTERVAL, NULL);
+
+		for (;;)
+		{
+			DWORD Read;
+			WINHTTP_WEB_SOCKET_BUFFER_TYPE Type;
+			Error = WinHttpWebSocketReceive(Websocket, State.Buffer + BufferSize, MAX_BUFFER_SIZE - BufferSize, &Read, &Type);
+			if (Error != NO_ERROR)
+			{
+				break;
+			}
+			BufferSize += Read;
+
+			if (Type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE)
+			{
+				JsonObject* Json = JsonObject_Parse(State.Buffer, BufferSize);
+				if (Json)
+				{
+					LPCWSTR JsonType = JsonObject_GetString(Json, JsonCSTR("type"));
+					if (StrCmpW(JsonType, L"MESSAGE") == 0)
+					{
+						JsonObject* Data = JsonObject_GetObject(Json, JsonCSTR("data"));
+						LPCWSTR Message = JsonObject_GetString(Data, JsonCSTR("message"));
+						if (Message)
+						{
+							JsonObject* Msg = JsonObject_ParseW(Message, -1);
+							LPCWSTR Type = JsonObject_GetString(Msg, JsonCSTR("type"));
+							if (Type)
+							{
+								if (StrCmpW(Type, L"stream-up") == 0)
+								{
+									LPCWSTR Topic = JsonObject_GetString(Data, JsonCSTR("topic"));
+									LPCWSTR Last = StrRChrW(Topic, NULL, L'.');
+									if (Last != NULL)
+									{
+										int UserId = StrToIntW(Last + 1);
+										ProcessUserOnline(UserId);
+									}
+								}
+								else if (StrCmpW(Type, L"stream-down") == 0)
+								{
+									LPCWSTR Topic = JsonObject_GetString(Data, JsonCSTR("topic"));
+									LPCWSTR Last = StrRChrW(Topic, NULL, L'.');
+									if (Last != NULL)
+									{
+										int UserId = StrToIntW(Last + 1);
+										ProcessUserOffline(UserId);
+									}
+								}
+							}
+							JsonRelease(Msg);
+						}
+						JsonRelease(Data);
+					}
+					JsonRelease(Json);
+				}
+				BufferSize = 0;
+			}
+			else if (Type != WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE)
+			{
+				// binary message type is not expected
+				break;
+			}
+		}
+
+		KillTimer(State.Window, TIMER_WEBSOCKET_PING);
+		PostMessageW(State.Window, WM_TWITCH_NOTIFY_TRAY_ICON, 1, 0);
+	}
+
+	WinHttpWebSocketClose(Websocket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
+	WinHttpCloseHandle(Websocket);
+	WinHttpCloseHandle(Connection);
 }
 
-static int ConverJsonStringToW(char* src, int length, WCHAR* dst, int dstLength)
+static DWORD WINAPI UpdateThread(LPVOID Arg)
 {
-    char* read = src;
-    char* write = src;
-    while (length --> 0)
-    {
-        char ch = *read++;
-        if (ch == '\\')
-        {
-            if (length == 0)
-            {
-                break;
-            }
-            ch = *read++;
-            --length;
-            if (ch == '"') *write++ = L'"';
-            else if (ch == '\\') *write++ = L'\\';
-            else if (ch == '/') *write++ = L'/';
-            else if (ch == 'b') *write++ = L'\b';
-            else if (ch == 'f') *write++ = L'\f';
-            else if (ch == 'n') *write++ = L'\n';
-            else if (ch == 'r') *write++ = L'\r';
-            else if (ch == 't') *write++ = L'\t';
-            else if (ch == 'u')
-            {
-                if (length < 4)
-                {
-                    break;
-                }
+	for (;;)
+	{
+		LoadUsers();
+		DownloadUserList();
 
-                int value;
-                char tmp = read[4];
-                read[-2] = '0';
-                read[-1] = 'x';
-                read[4] = 0;
-                BOOL ok = StrToIntEx(read - 2, STIF_SUPPORT_HEX, &value);
-                Assert(ok);
-                read[4] = tmp;
-                read += 4;
-                length -= 4;
-
-                if (value >= 0xd800 && value <= 0xdfff)
-                {
-                    if (length < 6 || read[0] != '\\' || read[1] != 'u')
-                    {
-                        break;
-                    }
-
-                    int value2;
-                    tmp = read[6];
-                    read[0] = '0';
-                    read[1] = 'x';
-                    read[6] = 0;
-                    ok = StrToIntEx(read, STIF_SUPPORT_HEX, &value2);
-                    Assert(ok);
-                    read[6] = tmp;
-                    read += 6;
-                    length -= 6;
-                    if (value2 < 0xdc00 || value2 >= 0xdfff)
-                    {
-                        break;
-                    }
-
-                    value = ((value - 0xd800) << 10) + (value2 - 0xdc00) + 0x10000;
-                }
-
-                if (value < 0x80)
-                {
-                    *write++ = (char)value;
-                }
-                else if (value < 0x800)
-                {
-                    *write++ = (char)(0xc0 | (value >> 6));
-                    *write++ = (char)(0x80 | (value & 0x3f));
-                }
-                else if (value < 0x10000)
-                {
-                    *write++ = (char)(0xe0 | (value >> 12));
-                    *write++ = (char)(0x80 | ((value >> 6) & 0x3f));
-                    *write++ = (char)(0x80 | (value & 0x3f));
-                }
-                else
-                {
-                    Assert(value <= 0x10ffff);
-                    *write++ = (char)(0xf0 | (value >> 18));
-                    *write++ = (char)(0x80 | ((value >> 12) & 0x3f));
-                    *write++ = (char)(0x80 | ((value >> 6) & 0x3f));
-                    *write++ = (char)(0x80 | ((value & 0x3f)));
-                }
-            }
-            else
-            {
-                break;
-            }
-        }
-        else
-        {
-            *write++ = ch;
-        }
-    }
-
-    dstLength = MultiByteToWideChar(CP_UTF8, 0, src, (int)(write - src), dst, dstLength);
-    dst[dstLength] = 0;
-    return dstLength;
+		if (State.UserCount != 0)
+		{
+			DWORD Delay = 1000;
+			for (;;)
+			{
+				ConnectWebsocket();
+				if (WaitForSingleObject(State.ReloadEvent, Delay) == WAIT_OBJECT_0)
+				{
+					break;
+				}
+				if (Delay < 60 * 1000)
+				{
+					Delay *= 2;
+				}
+			}
+		}
+	}
 }
 
-static int UpdateUsers(void)
+static void TwitchNotify_OnActivated(WindowsToast* Toast, LPCWSTR Action)
 {
-    if (gUserCount == 0)
-    {
-        return 1;
-    }
-
-    DWORD dataLength = MAX_DOWNLOAD_SIZE;
-    char* data = HeapAlloc(gHeap, 0, 2 * MAX_DOWNLOAD_SIZE);
-    if (!data)
-    {
-        return 0;
-    }
-
-    WCHAR url[4096] = L"https://api.twitch.tv/kraken/streams?channel";
-    for (int i = 0; i < gUserCount; i++)
-    {
-        StringCbCatW(url, _countof(url), i == 0 ? L"=" : L",");
-        StringCbCatW(url, _countof(url), gUsers[i].name);
-    }
-
-    SendMessageW(gWindow, WM_TWITCH_NOTIFY_START_UPDATE, 0, 0);
-
-    int result = 1;
-
-    WCHAR* headers = L"Client-ID: jzkbprff40iqj646a697cyrvl0zt2m6\r\n\r\n";
-    if (!DownloadURL(url, headers, data, &dataLength))
-    {
-        SendMessageW(gWindow, WM_TWITCH_NOTIFY_UPDATE_ERROR, (WPARAM)L"Failed to connect to Twitch!", 0);
-        result = 0;
-    }
-    else
-    {
-        jsmn_parser parser;
-        jsmn_init(&parser);
-
-        jsmntok_t tokens[1024];
-        int t = jsmn_parse(&parser, data, dataLength, tokens, _countof(tokens));
-        if (t < 1 || tokens[0].type != JSMN_OBJECT)
-        {
-            SendMessage(gWindow, WM_TWITCH_NOTIFY_UPDATE_ERROR, (WPARAM)L"JSON parse error!", 0);
-            result = 0;
-        }
-        else
-        {
-            enum
-            {
-                STATE_ROOT,
-                STATE_ERROR,
-                STATE_STREAMS,
-                STATE_STREAM,
-                STATE_CHANNEL,
-            }
-            state = STATE_ROOT;
-
-            jsmn_iterator_t streams = { 0 };
-            jsmn_iterator_t stream = { 0 };
-            jsmn_iterator_t channel = { 0 };
-
-            jsmn_iterator_t iter;
-            int ok = jsmn_iterator_init(&iter, tokens, t, 0);
-            Assert(ok >= 0);
-
-            struct UserStatusOnline status;
-
-            for (;;)
-            {
-                jsmntok_t* id;
-                jsmntok_t* value;
-
-                int next = jsmn_iterator_next(&iter, &id, &value, 0);
-                if (next == 0)
-                {
-                    if (state == STATE_CHANNEL)
-                    {
-                        state = STATE_STREAM;
-                        iter = channel;
-                        continue;
-                    }
-                    if (state == STATE_STREAM)
-                    {
-                        SendMessageW(gWindow, WM_TWITCH_NOTIFY_USER_ONLINE, (WPARAM)&status, 0);
-                        state = STATE_STREAMS;
-                        iter = stream;
-                        continue;
-                    }
-                    if (state == STATE_STREAM)
-                    {
-                        state = STATE_ROOT;
-                        iter = streams;
-                        continue;
-                    }
-                    break;
-                }
-                else if (next < 0)
-                {
-                    SendMessage(gWindow, WM_TWITCH_NOTIFY_UPDATE_ERROR, (WPARAM)L"JSON parse error!", 0);
-                    result = 0;
-                    break;
-                }
-
-                if (state == STATE_CHANNEL)
-                {
-                    if (jsoneq(data, id, "name") && value->type == JSMN_STRING)
-                    {
-                        char* str = data + value->start;
-                        int length = value->end - value->start;
-                        ConverJsonStringToW(str, length, status.user, _countof(status.user));
-                    }
-                    else if (jsoneq(data, id, "logo") && value->type == JSMN_STRING)
-                    {
-                        char* str = data + value->start;
-                        int length = value->end - value->start;
-
-                        int urlLength = ConverJsonStringToW(str, length, url, _countof(url));
-                        status.icon = GetUserIcon(url, urlLength, data + MAX_DOWNLOAD_SIZE);
-                    }
-                }
-                else if (state == STATE_STREAM)
-                {
-                    if (jsoneq(data, id, "game") && value->type == JSMN_STRING)
-                    {
-                        char* str = data + value->start;
-                        int length = value->end - value->start;
-                        ConverJsonStringToW(str, length, status.game, _countof(status.game));
-                    }
-                    else if (jsoneq(data, id, "channel") && value->type == JSMN_OBJECT)
-                    {
-                        channel = iter;
-                        state = STATE_CHANNEL;
-                        jsmn_iterator_init(&iter, tokens, t, (int)(value - tokens));
-                    }
-                }
-                else if (state == STATE_STREAMS && value->type == JSMN_OBJECT)
-                {
-                    stream = iter;
-                    state = STATE_STREAM;
-                    jsmn_iterator_init(&iter, tokens, t, (int)(value - tokens));
-
-                    status.user[0] = 0;
-                    status.game[0] = 0;
-                    status.icon = NULL;
-                }
-                else if (state == STATE_ERROR)
-                {
-                    if (jsoneq(data, id, "message") && value->type == JSMN_STRING)
-                    {
-                        WCHAR message[256];
-                        char* str = data + value->start;
-                        int length = value->end - value->start;
-                        ConverJsonStringToW(str, length, message, _countof(message));
-                        SendMessage(gWindow, WM_TWITCH_NOTIFY_UPDATE_ERROR, (WPARAM)message,
-                            (LPARAM)L"Error from Twitch!");
-                        result = 0;
-                        break;
-                    }
-                }
-                else
-                {
-                    if (jsoneq(data, id, "error"))
-                    {
-                        state = STATE_ERROR;
-                    }
-                    else if (jsoneq(data, id, "streams") && value->type == JSMN_ARRAY)
-                    {
-                        streams = iter;
-                        state = STATE_STREAMS;
-                        jsmn_iterator_init(&iter, tokens, t, (int)(value - tokens));
-                    }
-                }
-            }
-        }
-    }
-
-    SendMessageW(gWindow, WM_TWITCH_NOTIFY_END_UPDATE, 0, 0);
-
-    HeapFree(gHeap, 0, data);
-    return result;
-}
-
-static void LoadUsers(char* data, int size)
-{
-    int begin = 0;
-    while (begin < size)
-    {
-        int end = begin;
-        while (end < size && data[end] != '\n' && data[end] != '\r')
-        {
-            ++end;
-        }
-
-        char* name = data + begin;
-        int nameLength = end - begin;
-        if (nameLength)
-        {
-            WCHAR wname[MAX_USER_NAME_LENGTH];
-            int wlength = MultiByteToWideChar(CP_UTF8, 0, name, nameLength, wname, _countof(wname));
-            wname[wlength] = 0;
-
-            SendMessageW(gWindow, WM_TWITCH_NOTIFY_ADD_USER, (WPARAM)wname, 0);
-        }
-
-        if (end + 1 < size && data[end] == '\r' && data[end + 1] == '\n')
-        {
-            ++end;
-        }
-
-        begin = end + 1;
-    }
-}
-
-static void ReloadUsers(void)
-{
-    SendMessageW(gWindow, WM_TWITCH_NOTIFY_REMOVE_USERS, 0, 0);
-
-    WCHAR config[MAX_PATH];
-    wnsprintfW(config, MAX_PATH, L"%s\\" TWITCH_NOTIFY_CONFIG, gExeFolder);
-
-    HANDLE file = CreateFileW(config, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL);
-    if (file != INVALID_HANDLE_VALUE)
-    {
-        DWORD size = GetFileSize(file, NULL);
-        if (size)
-        {
-            HANDLE mapping = CreateFileMappingW(file, NULL, PAGE_READONLY, 0, size, NULL);
-            if (mapping)
-            {
-                char* data = MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, size);
-                if (data)
-                {
-                    LoadUsers(data, size);
-                    UnmapViewOfFile(data);
-                }
-                CloseHandle(mapping);
-            }
-        }
-        CloseHandle(file);
-    }
-}
-
-static DWORD CALLBACK UpdateThread(LPVOID arg)
-{
-    (void)arg;
-
-    for (;;)
-    {
-        HANDLE handles[] = { gUpdateEvent, gConfigEvent };
-        DWORD wait = WaitForMultipleObjects(_countof(handles), handles, FALSE, INFINITE);
-
-        if (wait == WAIT_OBJECT_0)
-        {
-            UpdateUsers();
-        }
-        else if (wait == WAIT_OBJECT_0 + 1)
-        {
-            ReloadUsers();
-            SetEvent(gUpdateEvent);
-        }
-    }
-}
-
-static DWORD CALLBACK ConfigThread(LPVOID arg)
-{
-    (void)arg;
-
-    HANDLE handle = CreateFileW(gExeFolder, FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_WRITE,
-        NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-    Assert(handle != INVALID_HANDLE_VALUE);
-
-    for (;;)
-    {
-        char buffer[4096];
-        DWORD read;
-        BOOL ret = ReadDirectoryChangesW(handle, buffer, _countof(buffer), FALSE,
-            FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE, &read, NULL, NULL);
-        Assert(ret);
-
-        FILE_NOTIFY_INFORMATION* info = (void*)buffer;
-
-        while ((char*)info + sizeof(*info) <= buffer + read)
-        {
-            if (StrCmpNW(TWITCH_NOTIFY_CONFIG, info->FileName, info->FileNameLength) == 0)
-            {
-                if (info->Action == FILE_ACTION_REMOVED)
-                {
-                    ShowNotification(L"Config file '" TWITCH_NOTIFY_CONFIG L"' deleted!", NULL, NIIF_WARNING, NULL);
-                }
-                SetTimer(gWindow, RELOAD_CONFIG_TIMER_ID, RELOAD_CONFIG_TIMER_DELAY, NULL);
-            }
-
-            if (info->NextEntryOffset == 0)
-            {
-                break;
-            }
-
-            info = (void*)((char*)info + info->NextEntryOffset);
-        }
-    }
-}
-
-static void FindExeFolder(HMODULE instance)
-{
-    DWORD length = GetModuleFileNameW(instance, gExeFolder, _countof(gExeFolder));
-    while (length > 0 && gExeFolder[length] != L'\\')
-    {
-        --length;
-    }
-    gExeFolder[length] = 0;
-}
-
-static void SetupWIC(void)
-{
-    HRESULT hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
-    Assert(SUCCEEDED(hr));
-
-    hr = CoCreateInstance(&CLSID_WICImagingFactory, NULL, CLSCTX_INPROC_SERVER, &IID_IWICImagingFactory, &gWicFactory);
-    Assert(SUCCEEDED(hr));
+	if (Action[0] == L'P')
+	{
+		LPCWSTR Url = Action + 1;
+		OpenMpvUrl(Url);
+	}
+	else if (Action[0] == L'O')
+	{
+		LPCWSTR Url = Action + 1;
+		ShellExecuteW(NULL, L"open", Url, NULL, NULL, SW_SHOWNORMAL);
+	}
 }
 
 void WinMainCRTStartup(void)
 {
-    WNDCLASSEXW wc =
-    {
-        .cbSize = sizeof(wc),
-        .lpfnWndProc = WindowProc,
-        .hInstance = GetModuleHandleW(NULL),
-        .lpszClassName = L"TwitchNotifyWindowClass",
-    };
+	WNDCLASSEXW WindowClass =
+	{
+		.cbSize = sizeof(WindowClass),
+		.lpfnWndProc = &WindowProc,
+		.hInstance = GetModuleHandleW(NULL),
+		.lpszClassName = TWITCH_NOTIFY_NAME,
+	};
 
-    HWND existing = FindWindowW(wc.lpszClassName, NULL);
-    if (existing)
-    {
-        PostMessageW(existing, WM_TWITCH_NOTIFY_ALREADY_RUNNING, 0, 0);
-        ExitProcess(0);
-    }
+	// check if TwitchNotify is already running
+	HWND Existing = FindWindowW(WindowClass.lpszClassName, NULL);
+	if (Existing)
+	{
+		PostMessageW(Existing, WM_TWITCH_NOTIFY_ALREADY_RUNNING, 0, 0);
+		ExitProcess(0);
+	}
 
-    ATOM atom = RegisterClassExW(&wc);
-    Assert(atom);
+	// initialize Windows Toasts
+	WindowsToast_Init(&State.Toast, TWITCH_NOTIFY_NAME, TWITCH_NOTIFY_APPID);
+	WindowsToast_HideAll(&State.Toast, TWITCH_NOTIFY_APPID);
+	State.Toast.OnActivatedCallback = TwitchNotify_OnActivated;
 
-    gTwitchNotifyIcon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
-    Assert(gTwitchNotifyIcon);
+	// initialize Windows HTTP Services
+	State.Session = WinHttpOpen(NULL, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+	Assert(State.Session);
 
-    SetupWIC();
-    FindExeFolder(wc.hInstance);
-    if (IsMpvAndYdlInPath())
-    {
-        gUseMpvYdl = 1;
-    }
-    else if (IsLivestreamerInPath())
-    {
-        gUseLivestreamer = 1;
-    }
+	// setup paths
+	WCHAR ExeFolder[MAX_PATH];
+	GetModuleFileNameW(NULL, ExeFolder, ARRAYSIZE(ExeFolder));
+	PathRemoveFileSpecW(ExeFolder);
+	PathCombineW(State.IniPath, ExeFolder, TWITCH_NOTIFY_INI);
 
-    gHeap = GetProcessHeap();
-    Assert(gHeap);
+	// notifications on folder to monitor when ini file changes
+	State.ExeFolderHandle = CreateFileW(ExeFolder, FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, NULL);
+	Assert(State.ExeFolderHandle != INVALID_HANDLE_VALUE);
+	BOOL Ok = BindIoCompletionCallback(State.ExeFolderHandle, &OnMonitorIniChanges, 0);
+	Assert(Ok);
 
-    gInternet = InternetOpenW(L"TwitchNotify", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
-    Assert(gInternet);
+	// load tray icons
+	State.Icon[0] = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
+	State.Icon[1] = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(2));
+	Assert(State.Icon[0] && State.Icon[1]);
 
-    gUpdateEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
-    Assert(gUpdateEvent);
+	// create window & do the message loop
+	ATOM Atom = RegisterClassExW(&WindowClass);
+	Assert(Atom);
 
-    gConfigEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
-    Assert(gConfigEvent);
+	WM_TASKBARCREATED = RegisterWindowMessageW(L"TaskbarCreated");
+	Assert(WM_TASKBARCREATED);
 
-    gWindow = CreateWindowExW(0, wc.lpszClassName, TWITCH_NOTIFY_TITLE,
-        WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
-        CW_USEDEFAULT, NULL, NULL, wc.hInstance, NULL);
-    Assert(gWindow);
+	State.Window = CreateWindowExW(0, WindowClass.lpszClassName, WindowClass.lpszClassName,
+		WS_OVERLAPPEDWINDOW, CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT,
+		CW_USEDEFAULT, NULL, NULL, WindowClass.hInstance, NULL);
+	Assert(State.Window);
 
-    HANDLE update = CreateThread(NULL, 0, UpdateThread, NULL, 0, NULL);
-    Assert(update);
+	// start background thread for user list loading & websocket
+	State.ReloadEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+	Assert(State.ReloadEvent);
+	HANDLE Thread = CreateThread(NULL, 0, &UpdateThread, NULL, 0, NULL);
+	Assert(Thread);
 
-    HANDLE config = CreateThread(NULL, 0, ConfigThread, NULL, 0, NULL);
-    Assert(config);
-
-    for (;;)
-    {
-        MSG msg;
-        BOOL ret = GetMessageW(&msg, NULL, 0, 0);
-        if (ret == 0)
-        {
-            ExitProcess(0);
-        }
-        Assert(ret > 0);
-
-        TranslateMessage(&msg);
-        DispatchMessageW(&msg);
-    }
+	for (;;)
+	{
+		MSG Message;
+		if (GetMessageW(&Message, NULL, 0, 0) <= 0)
+		{
+			ExitProcess(0);
+		}
+		TranslateMessage(&Message);
+		DispatchMessageW(&Message);
+	}
 }

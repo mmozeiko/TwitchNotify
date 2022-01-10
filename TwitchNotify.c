@@ -742,7 +742,25 @@ static void ProcessUserOnline(UINT UserId)
 		{
 			char* Query = State.Buffer;
 			int QuerySize = wsprintfA(Query, "{\"query\":\"{users(ids:[%u]){stream{title,game{displayName}}}}\"}", UserId);
-			DWORD ReadSize = SendGqlQuery(Query, QuerySize);
+
+			DWORD ReadSize;
+
+			// try to get info 5 times with 1second delays
+			// TODO: ideally this should be handle by timer on window to not block this thread
+			int Retries = 5;
+			for (int i = 0; i < 5; i++)
+			{
+				if (i != 0) Sleep(1000);
+				ReadSize = SendGqlQuery(Query, QuerySize);
+				if (ReadSize != 0)
+				{
+					break;
+				}
+			}
+
+			User->StreamName[0] = 0;
+			User->GameName[0] = 0;
+
 			if (ReadSize != 0)
 			{
 				JsonObject* Json = JsonObject_Parse(State.Buffer, ReadSize);
@@ -755,15 +773,14 @@ static void ProcessUserOnline(UINT UserId)
 					LPCWSTR StreamName = JsonObject_GetString(Stream, JsonCSTR("title"));
 					StrCpyNW(User->StreamName, StreamName ? StreamName : L"", MAX_STRING_LENGTH);
 
-					JsonObject* Game = JsonObject_GetObject(Stream, JsonCSTR("stream"));
+					JsonObject* Game = JsonObject_GetObject(Stream, JsonCSTR("game"));
 					LPCWSTR GameName = JsonObject_GetString(Game, JsonCSTR("displayName"));
 					StrCpyNW(User->GameName, GameName ? GameName : L"", MAX_STRING_LENGTH);
-
-					ShowUserNotification(User);
 
 					JsonRelease(Game);
 					JsonRelease(Stream);
 				}
+
 				JsonRelease(UserData);
 				JsonRelease(Users);
 				JsonRelease(Data);
@@ -771,6 +788,7 @@ static void ProcessUserOnline(UINT UserId)
 			}
 
 			User->IsOnline = TRUE;
+			ShowUserNotification(User);
 
 			return;
 		}

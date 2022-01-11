@@ -27,7 +27,10 @@
 
 #define WM_TWITCH_NOTIFY_COMMAND         (WM_USER + 1)
 #define WM_TWITCH_NOTIFY_ALREADY_RUNNING (WM_USER + 2)
-#define WM_TWITCH_NOTIFY_TRAY_ICON       (WM_USER + 3)
+#define WM_TWITCH_NOTIFY_WEBSOCKET       (WM_USER + 3) // wparam=bool for connection status
+#define WM_TWITCH_NOTIFY_USER_STATUS     (WM_USER + 4) // wparam=UserId, lparam=viewer count, negative for disconnect
+#define WM_TWITCH_NOTIFY_USER_STREAM     (WM_USER + 5) // wparam=UserId, lparam=JsonObject for game & stream name
+#define WM_TWITCH_NOTIFY_USER_INFO       (WM_USER + 6) // wparam=JsonObject for user
 
 #define CMD_OPEN_HOMEPAGE 10
 #define CMD_USE_MPV       20
@@ -44,14 +47,13 @@
 #define MAX_USER_COUNT    50 // oficially documented user count limit for Twitch websocket
 #define MAX_STRING_LENGTH 256
 
-#define MAX_BUFFER_SIZE     (1024*1024)   // 1 MiB
 #define MAX_IMAGE_CACHE_AGE (60*60*24*7)  // 1 week in seconds
 
 #define TIMER_RELOAD_USERS 1
 #define TIMER_RELOAD_USERS_DELAY 100 // msec
 
 #define TIMER_WEBSOCKET_PING 2
-#define TIMER_WEBSOCKET_PING_INTERVAL (2*60*1000) // 2 minutes in msec
+#define TIMER_WEBSOCKET_PING_INTERVAL (2*60*1000) // 2 minutes in msec, Twitch requires at least one ping per 5 minutes
 
 struct
 {
@@ -77,40 +79,52 @@ typedef struct
 {
 	WCHAR Name[MAX_STRING_LENGTH];
 	WCHAR DisplayName[MAX_STRING_LENGTH];
-	WCHAR GameName[MAX_STRING_LENGTH];
-	WCHAR StreamName[MAX_STRING_LENGTH];
-	WCHAR ImagePath[MAX_PATH];
-	UINT UserId;
+	WCHAR ImagePath[MAX_STRING_LENGTH];
+	int UserId;
+	int ViewerCount;
 	BOOL IsOnline;
+	void* Notification;
 } User;
 
 struct
 {
-	HICON Icon[2];
+	HICON Icon;
+	HICON IconDisconnected;
 	HWND Window;
 	WindowsToast Toast;
 	HINTERNET Session;
+	HINTERNET Websocket;
+	PTP_POOL ThreadPool;
 
 	WCHAR IniPath[MAX_PATH];
 	FILETIME LastIniWriteTime;
 
-	HANDLE ExeFolderHandle;
 	BYTE ExeFolderChanges[4096];
 	OVERLAPPED ExeFolderOverlapped;
+	HANDLE ExeFolderHandle;
 
 	UINT Quality;
 	BOOL UseMpv;
 
 	User Users[MAX_USER_COUNT];
 	int UserCount;
-
-	HANDLE ReloadEvent;
-	HINTERNET Websocket;
-	char Buffer[MAX_BUFFER_SIZE];
 }
 static State;
 
-static void AddTrayIcon(HWND Window)
+// http://www.isthe.com/chongo/tech/comp/fnv/
+static UINT64 GetFnv1Hash(const void* Ptr, int Size)
+{
+	const BYTE* Bytes = Ptr;
+	UINT64 Hash = 14695981039346656037ULL;
+	for (int Index = 0; Index < Size; Index++)
+	{
+		Hash *= 1099511628211ULL;
+		Hash ^= Bytes[Index];
+	}
+	return Hash;
+}
+
+static void AddTrayIcon(HWND Window, HICON Icon)
 {
 	NOTIFYICONDATAW Data =
 	{
@@ -118,7 +132,7 @@ static void AddTrayIcon(HWND Window)
 		.hWnd = Window,
 		.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP,
 		.uCallbackMessage = WM_TWITCH_NOTIFY_COMMAND,
-		.hIcon = State.Icon[0],
+		.hIcon = Icon,
 	};
 	StrCpyNW(Data.szInfoTitle, TWITCH_NOTIFY_NAME, ARRAYSIZE(Data.szInfoTitle));
 	Assert(Shell_NotifyIconW(NIM_ADD, &Data));
@@ -154,7 +168,7 @@ static void ShowTrayMessage(HWND Window, DWORD InfoType, LPCWSTR Message)
 		.hWnd = Window,
 		.uFlags = NIF_INFO,
 		.dwInfoFlags = InfoType,
-		.hIcon = State.Icon[0],
+		.hIcon = State.Websocket ? State.Icon : State.IconDisconnected,
 	};
 	StrCpyNW(Data.szInfo, Message, ARRAYSIZE(Data.szInfo));
 	StrCpyNW(Data.szInfoTitle, TWITCH_NOTIFY_NAME, ARRAYSIZE(Data.szInfoTitle));
@@ -211,31 +225,10 @@ static void OpenMpvUrl(LPCWSTR Url)
 	ShellExecuteW(NULL, L"open", L"mpv.exe", Args, NULL, SW_SHOWNORMAL);
 }
 
-static int XmlEscape(WCHAR* Dst, LPCWSTR String)
-{
-	WCHAR* Ptr = Dst;
-	for (const WCHAR* C = String; *C; C++)
-	{
-		if (*C == L'"')       Ptr += wsprintfW(Ptr, L"&quot;");
-		else if (*C == L'\'') Ptr += wsprintfW(Ptr, L"&apos;");
-		else if (*C == L'<')  Ptr += wsprintfW(Ptr, L"&lt;");
-		else if (*C == L'>')  Ptr += wsprintfW(Ptr, L"&gt;");
-		else if (*C == L'&')  Ptr += wsprintfW(Ptr, L"&amp;");
-		else *Ptr++ = *C;
-	}
-	return (int)(Ptr - Dst);
-}
-
 static void ShowUserNotification(User* User)
 {
-	WCHAR* Xml = (WCHAR*)State.Buffer;
-	WCHAR* Ptr = Xml;
-
-	DWORD ToastType = 1;
-	if (User->StreamName[0] && User->GameName[0])      ToastType = 4;
-	else if (User->StreamName[0] || User->GameName[0]) ToastType = 2;
-
 	WCHAR ImagePath[MAX_PATH];
+
 	if (GetFileAttributesW(User->ImagePath) == INVALID_FILE_ATTRIBUTES)
 	{
 		// in case image file is missing, use generic twitch image from our icon
@@ -276,43 +269,450 @@ static void ShowUserNotification(User* User)
 	{
 		if (*P == '\\') *P = '/';
 	}
-	Ptr += wsprintfW(Ptr, L"<toast><visual><binding template=\"ToastImageAndText0%u\"><image id=\"1\" src=\"file:///%s\"/>", ToastType, ImagePath);
-	Ptr += wsprintfW(Ptr, L"<text id=\"1\">");
-	Ptr += XmlEscape(Ptr, User->DisplayName);
-	Ptr += wsprintfW(Ptr, L" is live!</text>");
 
-	DWORD Line = 2;
-	if (User->GameName[0])
-	{
-		Ptr += wsprintfW(Ptr, L"<text id=\"%u\">", Line++);
-		Ptr += XmlEscape(Ptr, User->GameName);
-		Ptr += wsprintfW(Ptr, L"</text>");
-	}
-	if (User->StreamName[0])
-	{
-		Ptr += wsprintfW(Ptr, L"<text id=\"%u\">", Line++);
-		Ptr += XmlEscape(Ptr, User->StreamName);
-		Ptr += wsprintfW(Ptr, L"</text>");
-	}
-	Ptr += wsprintfW(Ptr, L"</binding></visual><actions>");
+	WCHAR Xml[4096];
+	int XmlLength = 0;
+
+	// use long duration, because getting game & stream name often takes a while
+	XmlLength = StrCatChainW(Xml, ARRAYSIZE(Xml), XmlLength,
+		L"<toast duration=\"long\"><visual><binding template=\"ToastGeneric\">"
+		L"<image placement=\"appLogoOverride\" src=\"");
+	XmlLength = StrCatChainW(Xml, ARRAYSIZE(Xml), XmlLength, ImagePath);
+	XmlLength = StrCatChainW(Xml, ARRAYSIZE(Xml), XmlLength,
+		L"\"/>"
+		L"<text hint-maxLines=\"3\">{user}</text>"
+		L"<text>{game}</text>"
+		L"<text>{stream}</text>"
+		L"</binding></visual><actions>");
 
 	if (IsMpvInPath())
 	{
-		Ptr += wsprintfW(Ptr, L"<action content=\"Play\" arguments=\"Phttps://www.twitch.tv/%s\"/>", User->Name);
+		XmlLength = StrCatChainW(Xml, ARRAYSIZE(Xml), XmlLength, L"<action content=\"Play\" arguments=\"Phttps://www.twitch.tv/");
+		XmlLength = StrCatChainW(Xml, ARRAYSIZE(Xml), XmlLength, User->Name);
+		XmlLength = StrCatChainW(Xml, ARRAYSIZE(Xml), XmlLength, L"\"/>");
 	}
-	Ptr += wsprintfW(Ptr, L"<action content=\"Open Browser\" arguments=\"Ohttps://www.twitch.tv/%s\"/>", User->Name);
-	Ptr += wsprintfW(Ptr, L"</actions></toast>");
 
-	int XmlLength = (int)(Ptr - Xml);
-	void* Item = WindowsToast_Show(&State.Toast, Xml, XmlLength);
-	WindowsToast_Release(&State.Toast, Item);
+	XmlLength = StrCatChainW(Xml, ARRAYSIZE(Xml), XmlLength, L"<action content=\"Open Browser\" arguments=\"Ohttps://www.twitch.tv/");
+	XmlLength = StrCatChainW(Xml, ARRAYSIZE(Xml), XmlLength, User->Name);
+	XmlLength = StrCatChainW(Xml, ARRAYSIZE(Xml), XmlLength,
+		L"\"/>"
+		L"</actions></toast>");
+
+	LPCWSTR Data[][2] =
+	{
+		{ L"user",   User->DisplayName },
+		{ L"game",   L"..."            },
+		{ L"stream", L""               },
+	};
+	User->Notification = WindowsToast_Create(&State.Toast, Xml, XmlLength, Data, ARRAYSIZE(Data));
+	WindowsToast_Show(&State.Toast, User->Notification);
+}
+
+static void WebsocketPing(void)
+{
+	char Data[] = "{\"type\":\"PING\"}";
+	WinHttpWebSocketSend(State.Websocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, Data, ARRAYSIZE(Data));
+}
+
+static void WesocketListenUser(int UserId, BOOL Listen)
+{
+	if (State.Websocket)
+	{
+		char Data[1024];
+		int DataSize = wsprintfA(Data, "{\"type\":\"%s\",\"data\":{\"topics\":[\"video-playback-by-id.%d\"]}}", Listen ? "LISTEN" : "UNLISTEN", UserId);
+		WinHttpWebSocketSend(State.Websocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, Data, DataSize);
+	}
+}
+
+static int DoGqlQuery(char* Query, int QuerySize, char* Buffer, int BufferSize)
+{
+	int ReadSize = 0;
+
+	HINTERNET Connection = WinHttpConnect(State.Session, L"gql.twitch.tv", INTERNET_DEFAULT_HTTPS_PORT, 0);
+	if (Connection)
+	{
+		HINTERNET Request = WinHttpOpenRequest(Connection, L"POST", L"/gql", NULL, NULL, NULL, WINHTTP_FLAG_SECURE);
+		if (Request)
+		{
+			WCHAR Headers[] = L"Client-ID: kimne78kx3ncx6brgo4mv6wki5h1ko";
+			if (WinHttpSendRequest(Request, Headers, ARRAYSIZE(Headers) - 1, Query, QuerySize, QuerySize, 0) && WinHttpReceiveResponse(Request, NULL))
+			{
+				DWORD Status = 0;
+				DWORD StatusSize = sizeof(Status);
+				WinHttpQueryHeaders(Request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &Status, &StatusSize, WINHTTP_NO_HEADER_INDEX);
+
+				if (Status == HTTP_STATUS_OK)
+				{
+					while (ReadSize < BufferSize)
+					{
+						DWORD Read;
+						if (!WinHttpReadData(Request, Buffer + ReadSize, BufferSize - ReadSize, &Read))
+						{
+							break;
+						}
+						if (Read == 0)
+						{
+							break;
+						}
+						ReadSize += Read;
+					}
+				}
+			}
+			WinHttpCloseHandle(Request);
+		}
+		WinHttpCloseHandle(Connection);
+	}
+
+	return ReadSize;
+}
+
+static void GetImagePath(LPWSTR ImagePath, LPCWSTR ImageUrl)
+{
+	DWORD ImageUrlLength = lstrlenW(ImageUrl);
+	UINT64 Hash = GetFnv1Hash(ImageUrl, ImageUrlLength * sizeof(WCHAR));
+
+	DWORD TempLength = GetTempPathW(MAX_PATH, ImagePath);
+	Assert(TempLength);
+
+	LPWSTR Extension = StrRChrW(ImageUrl, ImageUrl + ImageUrlLength, L'.');
+	wsprintfW(ImagePath + TempLength, L"%016I64x%s", Hash, Extension);
+}
+
+static void CALLBACK DownloadUserImageWork(PTP_CALLBACK_INSTANCE Instance, PVOID Context, PTP_WORK Work)
+{
+	LPWSTR ImageUrl = (LPWSTR)Context;
+
+	WCHAR ImagePath[MAX_PATH];
+	GetImagePath(ImagePath, ImageUrl);
+
+	WCHAR HostName[MAX_PATH];
+	WCHAR UrlPath[MAX_PATH];
+
+	URL_COMPONENTSW Url =
+	{
+		.dwStructSize = sizeof(Url),
+		.lpszHostName = HostName,
+		.lpszUrlPath = UrlPath,
+		.dwHostNameLength = ARRAYSIZE(HostName),
+		.dwUrlPathLength = ARRAYSIZE(UrlPath),
+	};
+
+	if (WinHttpCrackUrl(ImageUrl, 0, 0, &Url))
+	{
+		HINTERNET Connection = WinHttpConnect(State.Session, HostName, Url.nPort, 0);
+		if (Connection)
+		{
+			HINTERNET Request = WinHttpOpenRequest(Connection, L"GET", UrlPath, NULL, NULL, NULL, Url.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+			if (Request)
+			{
+				if (WinHttpSendRequest(Request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(Request, NULL))
+				{
+					DWORD Status = 0;
+					DWORD StatusSize = sizeof(Status);
+					WinHttpQueryHeaders(Request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &Status, &StatusSize, WINHTTP_NO_HEADER_INDEX);
+
+					if (Status == HTTP_STATUS_OK)
+					{
+						HANDLE File = CreateFileW(ImagePath, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+						if (File != INVALID_HANDLE_VALUE)
+						{
+							char Buffer[65536];
+							for (;;)
+							{
+								DWORD Read;
+								if (!WinHttpReadData(Request, Buffer, sizeof(Buffer), &Read) || Read == 0)
+								{
+									break;
+								}
+								DWORD Written;
+								WriteFile(File, Buffer, Read, &Written, NULL);
+							}
+							CloseHandle(File);
+						}
+					}
+					WinHttpCloseHandle(Request);
+				}
+				WinHttpCloseHandle(Connection);
+			}
+		}
+	}
+
+	LocalFree(ImageUrl);
+
+	CloseThreadpoolWork(Work);
+}
+
+static void DownloadUserImage(LPWSTR ImagePath, LPCWSTR ImageUrl)
+{
+	GetImagePath(ImagePath, ImageUrl);
+
+	WIN32_FILE_ATTRIBUTE_DATA Data;
+	if (GetFileAttributesExW(ImagePath, GetFileExInfoStandard, &Data))
+	{
+		UINT64 LastWrite = (((UINT64)Data.ftLastWriteTime.dwHighDateTime) << 32) + Data.ftLastWriteTime.dwLowDateTime;
+
+		FILETIME NowTime;
+		GetSystemTimeAsFileTime(&NowTime);
+
+		UINT64 Now = (((UINT64)NowTime.dwHighDateTime) << 32) + NowTime.dwLowDateTime;
+		UINT64 Expires = LastWrite + (UINT64)MAX_IMAGE_CACHE_AGE * 10 * 1000 * 1000;
+		if (Now < Expires)
+		{
+			// ok image up to date
+			return;
+		}
+	}
+
+	// queue downloading to background
+
+	TP_CALLBACK_ENVIRON Environ;
+	InitializeThreadpoolEnvironment(&Environ);
+	SetThreadpoolCallbackPool(&Environ, State.ThreadPool);
+
+	PTP_WORK Work = CreateThreadpoolWork(&DownloadUserImageWork, StrDupW(ImageUrl), &Environ);
+	Assert(Work);
+
+	SubmitThreadpoolWork(Work);
+}
+
+static void CALLBACK DownloadUserInfoWork(PTP_CALLBACK_INSTANCE Instance, PVOID Context, PTP_WORK Work)
+{
+	char* Query = (char*)Context;
+
+	char Buffer[65536];
+	int BufferSize = DoGqlQuery(Query, lstrlenA(Query), Buffer, sizeof(Buffer));
+	LocalFree(Query);
+
+	JsonObject* Json = JsonObject_Parse(Buffer, BufferSize);
+	JsonArray* Errors = JsonObject_GetArray(Json, JsonCSTR("errors"));
+	if (Errors)
+	{
+		JsonObject* ErrorMessage = JsonArray_GetObject(Errors, 0);
+		LPCWSTR Message = JsonObject_GetString(ErrorMessage, JsonCSTR("message"));
+		ShowTrayMessage(State.Window, NIIF_ERROR, Message);
+		JsonRelease(ErrorMessage);
+		JsonRelease(Errors);
+	}
+	else
+	{
+		JsonObject* Data = JsonObject_GetObject(Json, JsonCSTR("data"));
+		JsonArray* Users = JsonObject_GetArray(Data, JsonCSTR("users"));
+		JsonRelease(Data);
+
+		PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_INFO, (WPARAM)Users, 0);
+	}
+	JsonRelease(Json);
+
+	CloseThreadpoolWork(Work);
+}
+
+static void LoadUsers(void)
+{
+	WIN32_FILE_ATTRIBUTE_DATA Data;
+	if (!GetFileAttributesExW(State.IniPath, GetFileExInfoStandard, &Data))
+	{
+		// ini file deleted?
+		return;
+	}
+
+	if (CompareFileTime(&State.LastIniWriteTime, &Data.ftLastWriteTime) >= 0)
+	{
+		// ini file is up to date
+		return;
+	}
+
+	State.LastIniWriteTime = Data.ftLastWriteTime;
+
+	WCHAR Users[32768]; // max size GetPrivateProfileSection() can return
+	Users[0] = 0;
+	GetPrivateProfileSectionW(L"users", Users, ARRAYSIZE(Users), State.IniPath);
+
+	WCHAR* Ptr = Users;
+
+	LPCWSTR NewUsers[MAX_USER_COUNT];
+
+	int NewCount = 0;
+	while (*Ptr != 0)
+	{
+		if (NewCount == MAX_USER_COUNT)
+		{
+			ShowTrayMessage(State.Window, NIIF_WARNING, L"More than 50 users is not supported");
+			break;
+		}
+
+		int PtrLength = lstrlenW(Ptr);
+
+		WCHAR* Name = Ptr;
+		StrTrimW(Name, L" \t");
+		if (Name[0])
+		{
+			NewUsers[NewCount++] = Name;
+		}
+		Ptr += PtrLength + 1;
+	}
+
+	int OldCount = State.UserCount;
+
+	User OldUsers[MAX_USER_COUNT];
+	CopyMemory(OldUsers, State.Users, sizeof(User) * OldCount);
+
+	// copy over existing users
+	int UserCount = 0;
+	for (int OldIndex = 0; OldIndex < OldCount; OldIndex++)
+	{
+		for (int NewIndex = 0; NewIndex < NewCount; NewIndex++)
+		{
+			if (StrCmpW(OldUsers[OldIndex].Name, NewUsers[NewIndex]) == 0)
+			{
+				State.Users[UserCount++] = OldUsers[OldIndex];
+				NewUsers[NewIndex] = NULL;
+				OldUsers[OldIndex].Name[0] = 0;
+				break;
+			}
+		}
+	}
+
+	// unsubscribe from removed ones
+	for (int OldIndex = 0; OldIndex < OldCount; OldIndex++)
+	{
+		User* OldUser = &OldUsers[OldIndex];
+		if (OldUser->Name[0])
+		{
+			if (OldUser->UserId > 0)
+			{
+				WesocketListenUser(OldUser->UserId, FALSE);
+			}
+			if (OldUser->Notification)
+			{
+				WindowsToast_Release(&State.Toast, OldUser->Notification);
+				OldUser->Notification = NULL;
+			}
+		}
+	}
+
+	WCHAR Query[4096];
+	int QuerySize = 0;
+
+	QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, L"{\"query\":\"{users(logins:[");
+
+	LPCWSTR Delim = L"";
+
+	// add new users & prepare query to download their info - user id, display name, profile image, stream viewer count
+	for (int NewIndex = 0; NewIndex < NewCount; NewIndex++)
+	{
+		if (NewUsers[NewIndex])
+		{
+			User* User = &State.Users[UserCount++];
+			StrCpyNW(User->Name, NewUsers[NewIndex], MAX_STRING_LENGTH);
+			User->UserId = 0;
+			User->DisplayName[0] = 0;
+			User->ViewerCount = 0;
+			User->IsOnline = FALSE;
+			User->Notification = NULL;
+			
+			QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, Delim);
+			QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, L"\\\"");
+			QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, NewUsers[NewIndex]);
+			QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, L"\\\"");
+			Delim = L",";
+		}
+	}
+	State.UserCount = UserCount;
+
+	// allowed image widths: 28, 50, 70, 150, 300, 600
+	// use 70 because for 100% dpi scale the toast size is 48 pixels, for 200% it is 96
+	QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, L"]){id,displayName,profileImageURL(width:70),stream{viewersCount}}}\"}");
+
+	char QueryBytes[4096];
+	QuerySize = WideCharToMultiByte(CP_UTF8, 0, Query, QuerySize, QueryBytes, ARRAYSIZE(QueryBytes), NULL, NULL);
+	QueryBytes[QuerySize] = 0;
+
+	// queue downloading to background
+
+	TP_CALLBACK_ENVIRON Environ;
+	InitializeThreadpoolEnvironment(&Environ);
+	SetThreadpoolCallbackPool(&Environ, State.ThreadPool);
+
+	PTP_WORK Work = CreateThreadpoolWork(&DownloadUserInfoWork, StrDupA(QueryBytes), &Environ);
+	Assert(Work);
+
+	SubmitThreadpoolWork(Work);
+}
+
+static void DownloadUserStreamCommon(int UserId)
+{
+	char Query[1024];
+	int QuerySize = wsprintfA(Query, "{\"query\":\"{users(ids:[%d]){stream{title,game{displayName}}}}\"}", UserId);
+
+	char Buffer[4096];
+	int BufferSize = DoGqlQuery(Query, QuerySize, Buffer, sizeof(Buffer));
+
+	JsonObject* Json = BufferSize ? JsonObject_Parse(Buffer, BufferSize) : NULL;
+	JsonObject* Data = JsonObject_GetObject(Json, JsonCSTR("data"));
+	JsonArray* Users = JsonObject_GetArray(Data, JsonCSTR("users"));
+	JsonObject* UserData = JsonArray_GetObject(Users, 0);
+	JsonObject* Stream = JsonObject_GetObject(UserData, JsonCSTR("stream"));
+
+	PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STREAM, UserId, (LPARAM)Stream);
+
+	JsonRelease(UserData);
+	JsonRelease(Users);
+	JsonRelease(Data);
+	JsonRelease(Json);
+}
+
+static void CALLBACK DownloadUserStreamWork(PTP_CALLBACK_INSTANCE Instance, PVOID Context, PTP_WORK Work)
+{
+	int UserId = PtrToInt(Context);
+	DownloadUserStreamCommon(UserId);
+	CloseThreadpoolWork(Work);
+}
+
+static void CALLBACK DownloadUserStreamTimer(PTP_CALLBACK_INSTANCE Instance, PVOID Context, PTP_TIMER Timer)
+{
+	int UserId = PtrToInt(Context);
+	DownloadUserStreamCommon(UserId);
+	CloseThreadpoolTimer(Timer);
+}
+
+static void DownloadUserStream(int UserId, int Delay)
+{
+	if (Delay == 0)
+	{
+		TP_CALLBACK_ENVIRON Environ;
+		InitializeThreadpoolEnvironment(&Environ);
+		SetThreadpoolCallbackPool(&Environ, State.ThreadPool);
+
+		PTP_WORK Work = CreateThreadpoolWork(&DownloadUserStreamWork, IntToPtr(UserId), &Environ);
+		Assert(Work);
+
+		SubmitThreadpoolWork(Work);
+	}
+	else
+	{
+		TP_CALLBACK_ENVIRON Environ;
+		InitializeThreadpoolEnvironment(&Environ);
+		SetThreadpoolCallbackPool(&Environ, State.ThreadPool);
+
+		PTP_TIMER Timer = CreateThreadpoolTimer(&DownloadUserStreamTimer, IntToPtr(UserId), &Environ);
+		Assert(Timer);
+
+		// negative timer value means relative time
+		LARGE_INTEGER Time = { .QuadPart = -Delay * 10000LL }; // in 100 nsec units
+		FILETIME DueTime =
+		{
+			.dwLowDateTime = Time.LowPart,
+			.dwHighDateTime = Time.HighPart,
+		};
+		SetThreadpoolTimer(Timer, &DueTime, 0, 0);
+	}
 }
 
 static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPARAM LParam)
 {
 	if (Message == WM_CREATE)
 	{
-		AddTrayIcon(Window);
+		AddTrayIcon(Window, State.Icon); // initial icon will show up as connected, just to look prettier
 		OnMonitorIniChanges(-1, 0, NULL);
 		State.Quality = GetPrivateProfileIntW(L"player", L"quality", 0, State.IniPath);
 		State.UseMpv = GetPrivateProfileIntW(L"player", L"mpv", 1, State.IniPath);
@@ -324,6 +724,11 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 		WritePrivateProfileStringW(L"player", L"quality", Str, State.IniPath);
 		WritePrivateProfileStringW(L"player", L"mpv", State.UseMpv ? L"1" : L"0", State.IniPath);
 		RemoveTrayIcon(Window);
+		if (State.Websocket)
+		{
+			WinHttpWebSocketClose(State.Websocket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
+			WinHttpCloseHandle(State.Websocket);
+		}
 		PostQuitMessage(0);
 		return 0;
 	}
@@ -345,9 +750,23 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 			for (int Index = 0; Index < State.UserCount; Index++)
 			{
 				User* User = &State.Users[Index];
-				if (User->UserId)
+				if (User->UserId > 0)
 				{
-					AppendMenuW(Users, User->IsOnline ? MF_CHECKED : MF_STRING, CMD_USER + Index, User->DisplayName);
+					LPCWSTR Name = User->DisplayName[0] ? User->DisplayName : User->Name;
+					if (User->IsOnline)
+					{
+						WCHAR Caption[1024];
+						wsprintfW(Caption, L"%s\t%d", Name, User->ViewerCount);
+						AppendMenuW(Users, MF_CHECKED, CMD_USER + Index, Caption);
+					}
+					else
+					{
+						AppendMenuW(Users, MF_STRING, CMD_USER + Index, Name);
+					}
+				}
+				else // unknown user
+				{
+					AppendMenuW(Users, MF_GRAYED, 0, User->Name);
 				}
 			}
 			if (State.UserCount == 0)
@@ -422,549 +841,296 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 		ShowTrayMessage(Window, NIIF_INFO, TWITCH_NOTIFY_NAME" is already running");
 		return 0;
 	}
-	else if (Message == WM_TWITCH_NOTIFY_TRAY_ICON)
+	else if (Message == WM_TWITCH_NOTIFY_WEBSOCKET)
 	{
-		UpdateTrayIcon(Window, State.Icon[WParam]);
+		BOOL Connected = (BOOL)WParam;
+		UpdateTrayIcon(Window, Connected ? State.Icon : State.IconDisconnected);
+		if (Connected)
+		{
+			SetTimer(State.Window, TIMER_WEBSOCKET_PING, TIMER_WEBSOCKET_PING_INTERVAL, NULL);
+
+			for (int Index = 0; Index < State.UserCount; Index++)
+			{
+				User* User = &State.Users[Index];
+				if (User->UserId > 0)
+				{
+					WesocketListenUser(User->UserId, TRUE);
+				}
+			}
+		}
+		else
+		{
+			KillTimer(State.Window, TIMER_WEBSOCKET_PING);
+		}
+		return 0;
+	}
+	else if (Message == WM_TWITCH_NOTIFY_USER_STATUS)
+	{
+		int UserId = (int)WParam;
+		int ViewerCount = (int)LParam;
+		for (int Index = 0; Index < State.UserCount; Index++)
+		{
+			User* User = &State.Users[Index];
+			if (User->UserId == UserId)
+			{
+				if (ViewerCount < 0)
+				{
+					User->IsOnline = FALSE;
+				}
+				else if (User->IsOnline)
+				{
+					// user is already online, just update viewer count
+					User->ViewerCount = ViewerCount;
+				}
+				else
+				{
+					User->IsOnline = TRUE;
+					User->ViewerCount = ViewerCount;
+					ShowUserNotification(User);
+					DownloadUserStream(UserId, 0);
+				}
+				break;
+			}
+		}
+		return 0;
+	}
+	else if (Message == WM_TWITCH_NOTIFY_USER_STREAM)
+	{
+		int UserId = (int)WParam;
+		JsonObject* Stream = (JsonObject*)LParam;
+		for (int Index = 0; Index < State.UserCount; Index++)
+		{
+			User* User = &State.Users[Index];
+			if (User->UserId == UserId)
+			{
+				JsonObject* Game = JsonObject_GetObject(Stream, JsonCSTR("game"));
+				LPCWSTR GameName = JsonObject_GetString(Game, JsonCSTR("displayName"));
+				LPCWSTR StreamName = JsonObject_GetString(Stream, JsonCSTR("title"));
+
+				if (StreamName)
+				{
+					LPCWSTR Data[][2] =
+					{
+						{ L"game",   GameName   },
+						{ L"stream", StreamName },
+					};
+
+					if (User->Notification)
+					{
+						WindowsToast_Update(&State.Toast, User->Notification, Data, ARRAYSIZE(Data));
+						WindowsToast_Release(&State.Toast, User->Notification);
+						User->Notification = NULL;
+					}
+				}
+				else if (User->Notification != NULL) // if notification is still up
+				{
+					// cannot get user game & stream name
+					// retry a bit later - after 1 second
+					DownloadUserStream(UserId, 1000);
+				}
+
+				JsonRelease(Game);
+				break;
+			}
+		}
+		JsonRelease(Stream);
+		return 0;
+	}
+	else if (Message == WM_TWITCH_NOTIFY_USER_INFO)
+	{
+		JsonArray* Users = (JsonArray*)WParam;
+
+		int UserIndex = 0;
+		int UsersCount = JsonArray_GetCount(Users);
+		for (int Index = 0; Index < UsersCount; Index++)
+		{
+			User* User = &State.Users[UserIndex];
+			while (User->UserId != 0)
+			{
+				User = &State.Users[++UserIndex];
+			}
+
+			JsonObject* UserData = JsonArray_GetObject(Users, Index);
+			if (UserData == NULL)
+			{
+				// user does not exist
+				User->UserId = -1;
+			}
+			else
+			{
+				LPCWSTR Id = JsonObject_GetString(UserData, JsonCSTR("id"));
+				LPCWSTR ProfileImageUrl = JsonObject_GetString(UserData, JsonCSTR("profileImageURL"));
+				LPCWSTR DisplayName = JsonObject_GetString(UserData, JsonCSTR("displayName"));
+
+				StrCpyNW(User->DisplayName, DisplayName, MAX_STRING_LENGTH);
+				DownloadUserImage(User->ImagePath, ProfileImageUrl);
+				User->UserId = StrToIntW(Id);
+
+				JsonObject* Stream = JsonObject_GetObject(UserData, JsonCSTR("stream"));
+				User->ViewerCount = (int)JsonObject_GetNumber(Stream, JsonCSTR("viewersCount"));
+				JsonRelease(Stream);
+
+				User->IsOnline = Stream != NULL;
+				WesocketListenUser(User->UserId, TRUE);
+
+				JsonRelease(UserData);
+			}
+		}
+		JsonRelease(Users);
 		return 0;
 	}
  	else if (Message == WM_TIMER)
 	{
 		if (WParam == TIMER_RELOAD_USERS)
 		{
-			SetEvent(State.ReloadEvent);
 			KillTimer(Window, TIMER_RELOAD_USERS);
-			if (State.Websocket)
-			{
-				WinHttpWebSocketClose(State.Websocket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
-			}
+			LoadUsers();
 			return 0;
 		}
 		else if (WParam == TIMER_WEBSOCKET_PING)
 		{
-			char Data[] = "{\"type\":\"PING\"}";
-			WinHttpWebSocketSend(State.Websocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, Data, sizeof(Data) - 1);
+			WebsocketPing();
 			return 0;
 		}
 	}
-	else if (WM_TASKBARCREATED && Message == WM_TASKBARCREATED)
+	else if (Message == WM_TASKBARCREATED)
 	{
-		AddTrayIcon(Window);
+		AddTrayIcon(Window, State.Websocket ? State.Icon : State.IconDisconnected);
 		return 0;
 	}
 
 	return DefWindowProcW(Window, Message, WParam, LParam);
 }
 
-static void LoadUsers(void)
+static void WebsocketLoop(HINTERNET Websocket)
 {
-	WIN32_FILE_ATTRIBUTE_DATA Data;
-	if (!GetFileAttributesExW(State.IniPath, GetFileExInfoStandard, &Data))
+	// we don't expect to receive large messages over websocket
+	char Buffer[4096];
+	int BufferSize = 0;
+
+	for (;;)
 	{
-		// ini file deleted?
-		return;
-	}
-
-	if (CompareFileTime(&State.LastIniWriteTime, &Data.ftLastWriteTime) >= 0)
-	{
-		// ini file is up to date
-		return;
-	}
-
-	State.LastIniWriteTime = Data.ftLastWriteTime;
-
-	WCHAR Users[32768];
-	Users[0] = 0;
-	GetPrivateProfileSectionW(L"users", Users, ARRAYSIZE(Users), State.IniPath);
-
-	WCHAR* Ptr = Users;
-
-	int Count = 0;
-	while (*Ptr != 0)
-	{
-		if (Count == MAX_USER_COUNT)
+		int BufferAvailable = sizeof(Buffer) - BufferSize;
+		if (BufferAvailable == 0)
 		{
-			ShowTrayMessage(State.Window, NIIF_WARNING, L"More than 50 users is not supported");
+			// in case server is sending too much garbage data just disconnect
 			break;
 		}
-		User* User = &State.Users[Count];
-		User->UserId = 0;
 
-		WCHAR* Name = Ptr;
-		StrTrimW(Name, L" \t");
-		if (Name[0])
+		DWORD Read;
+		WINHTTP_WEB_SOCKET_BUFFER_TYPE Type;
+		if (WinHttpWebSocketReceive(Websocket, Buffer + BufferSize, BufferAvailable, &Read, &Type) != NO_ERROR)
 		{
-			StrCpyNW(User->Name, Name, MAX_STRING_LENGTH);
-			Count++;
+			// error reading from server or disconnected
+			break;
 		}
-		Ptr += lstrlenW(Ptr) + 1;
-	}
-	State.UserCount = Count;
-}
+		BufferSize += Read;
 
-// http://www.isthe.com/chongo/tech/comp/fnv/
-static UINT64 GetFnv1Hash(const void* Ptr, int Size)
-{
-	const BYTE* Bytes = Ptr;
-	UINT64 Hash = 14695981039346656037ULL;
-	for (int Index = 0; Index < Size; Index++)
-	{
-		Hash *= 1099511628211ULL;
-		Hash ^= Bytes[Index];
-	}
-	return Hash;
-}
-
-static void DownloadUserImage(LPWSTR ImagePath, LPCWSTR ImageUrl)
-{
-	DWORD ImageUrlLength = lstrlenW(ImageUrl);
-	UINT64 Hash = GetFnv1Hash(ImageUrl, ImageUrlLength * sizeof(WCHAR));
-
-	DWORD TempLength = GetTempPathW(MAX_PATH, ImagePath);
-	Assert(TempLength);
-
-	LPWSTR Extension = StrRChrW(ImageUrl, ImageUrl + ImageUrlLength, L'.');
-	wsprintfW(ImagePath + TempLength, L"%08x%08x%s", (DWORD)(Hash >> 32), (DWORD)Hash, Extension);
-
-	WIN32_FILE_ATTRIBUTE_DATA Data;
-	if (GetFileAttributesExW(ImagePath, GetFileExInfoStandard, &Data))
-	{
-		UINT64 LastWrite = (((UINT64)Data.ftLastWriteTime.dwHighDateTime) << 32) + Data.ftLastWriteTime.dwLowDateTime;
-
-		FILETIME NowTime;
-		GetSystemTimeAsFileTime(&NowTime);
-
-		UINT64 Now = (((UINT64)NowTime.dwHighDateTime) << 32) + NowTime.dwLowDateTime;
-		UINT64 Expires = LastWrite + (UINT64)MAX_IMAGE_CACHE_AGE * 10 * 1000 * 1000;
-		if (Now < Expires)
+		if (Type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE)
 		{
-			// ok image up to date
-			return;
-		}
-	}
-
-	// download image
-
-	WCHAR HostName[MAX_PATH];
-	WCHAR UrlPath[MAX_PATH];
-
-	URL_COMPONENTSW Url =
-	{
-		.dwStructSize = sizeof(Url),
-		.lpszHostName = HostName,
-		.lpszUrlPath = UrlPath,
-		.dwHostNameLength = ARRAYSIZE(HostName),
-		.dwUrlPathLength = ARRAYSIZE(UrlPath),
-	};
-
-	if (!WinHttpCrackUrl(ImageUrl, ImageUrlLength, 0, &Url))
-	{
-		// bad image url
-		return;
-	}
-
-	HINTERNET Connection = WinHttpConnect(State.Session, HostName, Url.nPort, 0);
-	if (Connection)
-	{
-		HINTERNET Request = WinHttpOpenRequest(Connection, L"GET", UrlPath, NULL, NULL, NULL, Url.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
-		if (Request)
-		{
-			if (WinHttpSendRequest(Request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(Request, NULL))
+			JsonObject* Json = JsonObject_Parse(Buffer, BufferSize);
+			if (Json)
 			{
-				DWORD Status = 0;
-				DWORD StatusSize = sizeof(Status);
-				WinHttpQueryHeaders(Request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &Status, &StatusSize, WINHTTP_NO_HEADER_INDEX);
-
-				if (Status == HTTP_STATUS_OK)
+				LPCWSTR JsonType = JsonObject_GetString(Json, JsonCSTR("type"));
+				if (StrCmpW(JsonType, L"MESSAGE") == 0)
 				{
-					HANDLE File = CreateFileW(ImagePath, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-					if (File != INVALID_HANDLE_VALUE)
+					JsonObject* Data = JsonObject_GetObject(Json, JsonCSTR("data"));
+
+					LPCWSTR Topic = JsonObject_GetString(Data, JsonCSTR("topic"));
+					LPCWSTR TopicLast = Topic ? StrRChrW(Topic, NULL, L'.') : NULL;
+					int UserId = TopicLast ? StrToIntW(TopicLast + 1) : 0;
+
+					LPCWSTR Message = JsonObject_GetString(Data, JsonCSTR("message"));
+					if (Message && UserId)
 					{
-						for (;;)
+						JsonObject* Msg = JsonObject_ParseW(Message, -1);
+						LPCWSTR Type = JsonObject_GetString(Msg, JsonCSTR("type"));
+						if (Type)
 						{
-							DWORD Read;
-							if (!WinHttpReadData(Request, State.Buffer, MAX_BUFFER_SIZE, &Read))
+							if (StrCmpW(Type, L"stream-up") == 0)
 							{
-								break;
+								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STATUS, UserId, 0);
 							}
-							if (Read == 0)
+							else if (StrCmpW(Type, L"stream-down") == 0)
 							{
-								break;
+								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STATUS, UserId, -1);
 							}
-							DWORD Written;
-							WriteFile(File, State.Buffer, Read, &Written, NULL);
+							else if (StrCmpW(Type, L"viewcount") == 0)
+							{
+								int ViewerCount = (int)JsonObject_GetNumber(Msg, JsonCSTR("viewers"));
+								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STATUS, UserId, ViewerCount);
+							}
 						}
-						CloseHandle(File);
+						JsonRelease(Msg);
+					}
+					JsonRelease(Data);
+				}
+				JsonRelease(Json);
+			}
+			BufferSize = 0;
+		}
+		else if (Type != WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE)
+		{
+			// binary message type is not expected, disconnect
+			break;
+		}
+	}
+}
+
+static DWORD WINAPI WebsocketThread(LPVOID Arg)
+{
+	// how much to delay between reconnection attempts
+	const DWORD DefaultDelay = 1000;  // 1 second default delay
+	const DWORD MaxDelay = 60 * 1000; // max delay = 1 minute
+	DWORD Delay = DefaultDelay;
+	for (;;)
+	{
+		HINTERNET Connection = WinHttpConnect(State.Session, L"pubsub-edge.twitch.tv", INTERNET_DEFAULT_HTTPS_PORT, 0);
+		if (Connection)
+		{
+			DWORD ConnectTimeout = 10; // seconds
+			WinHttpSetOption(Connection, WINHTTP_OPTION_CONNECT_TIMEOUT, &ConnectTimeout, sizeof(ConnectTimeout));
+
+			HINTERNET Request = WinHttpOpenRequest(Connection, L"GET", L"/v1", NULL, NULL, NULL, WINHTTP_FLAG_SECURE);
+			if (Request)
+			{
+				WinHttpSetOption(Request, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0);
+				if (WinHttpSendRequest(Request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(Request, 0))
+				{
+					HINTERNET Websocket = WinHttpWebSocketCompleteUpgrade(Request, 0);
+					if (Websocket)
+					{
+						WinHttpCloseHandle(Request);
+						Request = NULL;
+						Delay = DefaultDelay;
+
+						State.Websocket = Websocket;
+						PostMessageW(State.Window, WM_TWITCH_NOTIFY_WEBSOCKET, TRUE, 0);
+
+						WebsocketLoop(Websocket);
+
+						State.Websocket = NULL;
+						PostMessageW(State.Window, WM_TWITCH_NOTIFY_WEBSOCKET, FALSE, 0);
+
+						WinHttpWebSocketClose(Websocket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
+						WinHttpCloseHandle(Websocket);
 					}
 				}
-				WinHttpCloseHandle(Request);
+
+				if (Request)
+				{
+					WinHttpCloseHandle(Request);
+				}
 			}
 			WinHttpCloseHandle(Connection);
 		}
+
+		Sleep(Delay);
+		Delay = min(Delay * 2, MaxDelay);
 	}
 }
 
-static DWORD SendGqlQuery(char* Query, DWORD QuerySize)
-{
-	DWORD ReadSize = 0;
-
-	HINTERNET Connection = WinHttpConnect(State.Session, L"gql.twitch.tv", INTERNET_DEFAULT_HTTPS_PORT, 0);
-	if (Connection)
-	{
-		HINTERNET Request = WinHttpOpenRequest(Connection, L"POST", L"/gql", NULL, NULL, NULL, WINHTTP_FLAG_SECURE);
-		if (Request)
-		{
-			WCHAR Headers[] = L"Client-ID: kimne78kx3ncx6brgo4mv6wki5h1ko";
-			if (WinHttpSendRequest(Request, Headers, ARRAYSIZE(Headers) - 1, Query, QuerySize, QuerySize, 0) && WinHttpReceiveResponse(Request, NULL))
-			{
-				DWORD Status = 0;
-				DWORD StatusSize = sizeof(Status);
-				WinHttpQueryHeaders(Request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &Status, &StatusSize, WINHTTP_NO_HEADER_INDEX);
-
-				if (Status == HTTP_STATUS_OK)
-				{
-					for (;;)
-					{
-						DWORD Read;
-						if (!WinHttpReadData(Request, State.Buffer + ReadSize, MAX_BUFFER_SIZE - ReadSize, &Read))
-						{
-							break;
-						}
-						if (Read == 0)
-						{
-							break;
-						}
-						ReadSize += Read;
-					}
-				}
-			}
-			WinHttpCloseHandle(Request);
-		}
-		WinHttpCloseHandle(Connection);
-	}
-
-	return ReadSize;
-}
-
-static void DownloadUserList(void)
-{
-	char* Query = State.Buffer;
-
-	char* Ptr = Query;
-	{
-		Ptr += wsprintfA(Ptr, "{\"query\":\"{users(logins:[");
-		for (int UserIndex = 0; UserIndex < State.UserCount; UserIndex++)
-		{
-			Ptr += wsprintfA(Ptr, "%s\\\"%S\\\"", UserIndex ? "," : "", State.Users[UserIndex].Name);
-		}
-		// allowed image widths: 28, 50, 70, 150, 300, 600
-		Ptr += wsprintfA(Ptr, "]){id,displayName,profileImageURL(width:300),stream{title,game{displayName}}}}\"}");
-	}
-	DWORD QuerySize = (DWORD)(Ptr - Query);
-
-	DWORD ReadSize = SendGqlQuery(Query, QuerySize);
-	if (ReadSize == 0)
-	{
-		ShowTrayMessage(State.Window, NIIF_ERROR, L"Failed to download user list from Twitch");
-		return;
-	}
-
-	JsonObject* Json = JsonObject_Parse(State.Buffer, ReadSize);
-	JsonArray* Errors = JsonObject_GetArray(Json, JsonCSTR("errors"));
-	if (Errors)
-	{
-		JsonObject* ErrorMessage = JsonArray_GetObject(Errors, 0);
-		LPCWSTR Message = JsonObject_GetString(ErrorMessage, JsonCSTR("message"));
-		ShowTrayMessage(State.Window, NIIF_ERROR, Message);
-		JsonRelease(ErrorMessage);
-		JsonRelease(Errors);
-		JsonRelease(Json);
-		return;
-	}
-
-	JsonObject* Data = JsonObject_GetObject(Json, JsonCSTR("data"));
-	JsonArray* Users = JsonObject_GetArray(Data, JsonCSTR("users"));
-
-	UINT32 UsersCount = JsonArray_GetCount(Users);
-	for (UINT32 Index = 0; Index < UsersCount; Index++)
-	{
-		User* User = &State.Users[Index];
-
-		JsonObject* UserData = JsonArray_GetObject(Users, Index);
-		if (UserData == NULL)
-		{
-			// user does not exist
-			User->UserId = 0;
-		}
-		else
-		{
-			LPCWSTR Id = JsonObject_GetString(UserData, JsonCSTR("id"));
-			LPCWSTR ProfileImageUrl = JsonObject_GetString(UserData, JsonCSTR("profileImageURL"));
-			LPCWSTR DisplayName = JsonObject_GetString(UserData, JsonCSTR("displayName"));
-
-			StrCpyNW(User->DisplayName, DisplayName ? DisplayName : User->Name, MAX_STRING_LENGTH);
-			DownloadUserImage(User->ImagePath, ProfileImageUrl);
-			User->UserId = StrToIntW(Id);
-
-			JsonObject* Stream = JsonObject_GetObject(UserData, JsonCSTR("stream"));
-			if (Stream)
-			{
-				LPCWSTR StreamName = JsonObject_GetString(Stream, JsonCSTR("title"));
-				StrCpyNW(User->StreamName, StreamName ? StreamName : L"", MAX_STRING_LENGTH);
-
-				JsonObject* Game = JsonObject_GetObject(Stream, JsonCSTR("game"));
-				LPCWSTR GameName = JsonObject_GetString(Game, JsonCSTR("displayName"));
-				StrCpyNW(User->GameName, GameName ? GameName : L"", MAX_STRING_LENGTH);
-
-				User->IsOnline = TRUE;
-
-				JsonRelease(Game);
-				JsonRelease(Stream);
-			}
-			else
-			{
-				User->IsOnline = FALSE;
-			}
-
-			JsonRelease(UserData);
-		}
-	}
-	JsonRelease(Users);
-	JsonRelease(Data);
-	JsonRelease(Json);
-}
-
-static void ProcessUserOnline(UINT UserId)
-{
-	for (int Index = 0; Index < State.UserCount; Index++)
-	{
-		User* User = &State.Users[Index];
-		if (User->UserId == UserId)
-		{
-			char* Query = State.Buffer;
-			int QuerySize = wsprintfA(Query, "{\"query\":\"{users(ids:[%u]){stream{title,game{displayName}}}}\"}", UserId);
-
-			DWORD ReadSize;
-
-			// try to get info 5 times with 1second delays
-			// TODO: ideally this should be handle by timer on window to not block this thread
-			int Retries = 5;
-			for (int i = 0; i < 5; i++)
-			{
-				if (i != 0) Sleep(1000);
-				ReadSize = SendGqlQuery(Query, QuerySize);
-				if (ReadSize != 0)
-				{
-					break;
-				}
-			}
-
-			User->StreamName[0] = 0;
-			User->GameName[0] = 0;
-
-			if (ReadSize != 0)
-			{
-				JsonObject* Json = JsonObject_Parse(State.Buffer, ReadSize);
-				JsonObject* Data = JsonObject_GetObject(Json, JsonCSTR("data"));
-				JsonArray* Users = JsonObject_GetArray(Data, JsonCSTR("users"));
-				JsonObject* UserData = JsonArray_GetObject(Users, 0);
-				JsonObject* Stream = JsonObject_GetObject(UserData, JsonCSTR("stream"));
-				if (Stream)
-				{
-					LPCWSTR StreamName = JsonObject_GetString(Stream, JsonCSTR("title"));
-					StrCpyNW(User->StreamName, StreamName ? StreamName : L"", MAX_STRING_LENGTH);
-
-					JsonObject* Game = JsonObject_GetObject(Stream, JsonCSTR("game"));
-					LPCWSTR GameName = JsonObject_GetString(Game, JsonCSTR("displayName"));
-					StrCpyNW(User->GameName, GameName ? GameName : L"", MAX_STRING_LENGTH);
-
-					JsonRelease(Game);
-					JsonRelease(Stream);
-				}
-
-				JsonRelease(UserData);
-				JsonRelease(Users);
-				JsonRelease(Data);
-				JsonRelease(Json);
-			}
-
-			User->IsOnline = TRUE;
-			ShowUserNotification(User);
-
-			return;
-		}
-	}
-}
-
-static void ProcessUserOffline(UINT UserId)
-{
-	for (int Index = 0; Index < State.UserCount; Index++)
-	{
-		if (State.Users[Index].UserId == UserId)
-		{
-			State.Users[Index].IsOnline = FALSE;
-			return;
-		}
-	}
-}
-
-static void ConnectWebsocket(void)
-{
-	HINTERNET Connection = WinHttpConnect(State.Session, L"pubsub-edge.twitch.tv", INTERNET_DEFAULT_HTTPS_PORT, 0);
-	if (!Connection)
-	{
-		return;
-	}
-
-	HINTERNET Request = WinHttpOpenRequest(Connection, L"GET", L"/v1", NULL, NULL, NULL, WINHTTP_FLAG_SECURE);
-	if (!Request)
-	{
-		WinHttpCloseHandle(Connection);
-		return;
-	}
-
-	WinHttpSetOption(Request, WINHTTP_OPTION_UPGRADE_TO_WEB_SOCKET, NULL, 0);
-	if (!WinHttpSendRequest(Request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) || !WinHttpReceiveResponse(Request, 0))
-	{
-		WinHttpCloseHandle(Request);
-		WinHttpCloseHandle(Connection);
-		return;
-	}
-
-	HINTERNET Websocket = WinHttpWebSocketCompleteUpgrade(Request, 0);
-	WinHttpCloseHandle(Request);
-	if (!Websocket)
-	{
-		WinHttpCloseHandle(Connection);
-		return;
-	}
-
-	State.Websocket = Websocket;
-
-	DWORD Error;
-
-	for (int Index = 0; Index < State.UserCount; Index++)
-	{
-		UINT UserId = State.Users[Index].UserId;
-
-		if (UserId)
-		{
-			char Data[1024];
-			int DataLength = wsprintfA(Data, "{\"type\":\"LISTEN\",\"data\":{\"topics\":[\"video-playback-by-id.%u\"]}}", UserId);
-
-			Error = WinHttpWebSocketSend(Websocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, Data, DataLength);
-			if (Error != NO_ERROR)
-			{
-				break;
-			}
-		}
-	}
-
-	if (Error == NO_ERROR)
-	{
-		DWORD BufferSize = 0;
-
-		PostMessageW(State.Window, WM_TWITCH_NOTIFY_TRAY_ICON, 0, 0);
-		SetTimer(State.Window, TIMER_WEBSOCKET_PING, TIMER_WEBSOCKET_PING_INTERVAL, NULL);
-
-		for (;;)
-		{
-			DWORD Read;
-			WINHTTP_WEB_SOCKET_BUFFER_TYPE Type;
-			Error = WinHttpWebSocketReceive(Websocket, State.Buffer + BufferSize, MAX_BUFFER_SIZE - BufferSize, &Read, &Type);
-			if (Error != NO_ERROR)
-			{
-				break;
-			}
-			BufferSize += Read;
-
-			if (Type == WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE)
-			{
-				JsonObject* Json = JsonObject_Parse(State.Buffer, BufferSize);
-				if (Json)
-				{
-					LPCWSTR JsonType = JsonObject_GetString(Json, JsonCSTR("type"));
-					if (StrCmpW(JsonType, L"MESSAGE") == 0)
-					{
-						JsonObject* Data = JsonObject_GetObject(Json, JsonCSTR("data"));
-						LPCWSTR Message = JsonObject_GetString(Data, JsonCSTR("message"));
-						if (Message)
-						{
-							JsonObject* Msg = JsonObject_ParseW(Message, -1);
-							LPCWSTR Type = JsonObject_GetString(Msg, JsonCSTR("type"));
-							if (Type)
-							{
-								if (StrCmpW(Type, L"stream-up") == 0)
-								{
-									LPCWSTR Topic = JsonObject_GetString(Data, JsonCSTR("topic"));
-									LPCWSTR Last = StrRChrW(Topic, NULL, L'.');
-									if (Last != NULL)
-									{
-										int UserId = StrToIntW(Last + 1);
-										ProcessUserOnline(UserId);
-									}
-								}
-								else if (StrCmpW(Type, L"stream-down") == 0)
-								{
-									LPCWSTR Topic = JsonObject_GetString(Data, JsonCSTR("topic"));
-									LPCWSTR Last = StrRChrW(Topic, NULL, L'.');
-									if (Last != NULL)
-									{
-										int UserId = StrToIntW(Last + 1);
-										ProcessUserOffline(UserId);
-									}
-								}
-							}
-							JsonRelease(Msg);
-						}
-						JsonRelease(Data);
-					}
-					JsonRelease(Json);
-				}
-				BufferSize = 0;
-			}
-			else if (Type != WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE)
-			{
-				// binary message type is not expected
-				break;
-			}
-		}
-
-		KillTimer(State.Window, TIMER_WEBSOCKET_PING);
-		PostMessageW(State.Window, WM_TWITCH_NOTIFY_TRAY_ICON, 1, 0);
-	}
-
-	WinHttpWebSocketClose(Websocket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
-	WinHttpCloseHandle(Websocket);
-	WinHttpCloseHandle(Connection);
-}
-
-static DWORD WINAPI UpdateThread(LPVOID Arg)
-{
-	for (;;)
-	{
-		LoadUsers();
-		DownloadUserList();
-
-		if (State.UserCount != 0)
-		{
-			DWORD Delay = 1000;
-			for (;;)
-			{
-				ConnectWebsocket();
-				if (WaitForSingleObject(State.ReloadEvent, Delay) == WAIT_OBJECT_0)
-				{
-					break;
-				}
-				if (Delay < 60 * 1000)
-				{
-					Delay *= 2;
-				}
-			}
-		}
-	}
-}
-
-static void TwitchNotify_OnActivated(WindowsToast* Toast, LPCWSTR Action)
+static void TwitchNotify_OnActivated(WindowsToast* Toast, void* Item, LPCWSTR Action)
 {
 	if (Action[0] == L'P')
 	{
@@ -996,7 +1162,7 @@ void WinMainCRTStartup(void)
 		ExitProcess(0);
 	}
 
-	// initialize Windows Toasts
+	// initialize Windows Toast notifications
 	WindowsToast_Init(&State.Toast, TWITCH_NOTIFY_NAME, TWITCH_NOTIFY_APPID);
 	WindowsToast_HideAll(&State.Toast, TWITCH_NOTIFY_APPID);
 	State.Toast.OnActivatedCallback = TwitchNotify_OnActivated;
@@ -1004,6 +1170,12 @@ void WinMainCRTStartup(void)
 	// initialize Windows HTTP Services
 	State.Session = WinHttpOpen(NULL, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
 	Assert(State.Session);
+
+	// create thread pool with 2 threads for background downloads
+	State.ThreadPool = CreateThreadpool(NULL);
+	Assert(State.ThreadPool);
+	SetThreadpoolThreadMinimum(State.ThreadPool, 2);
+	SetThreadpoolThreadMaximum(State.ThreadPool, 2);
 
 	// setup paths
 	WCHAR ExeFolder[MAX_PATH];
@@ -1018,11 +1190,11 @@ void WinMainCRTStartup(void)
 	Assert(Ok);
 
 	// load tray icons
-	State.Icon[0] = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
-	State.Icon[1] = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(2));
-	Assert(State.Icon[0] && State.Icon[1]);
+	State.Icon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
+	State.IconDisconnected = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(2));
+	Assert(State.Icon && State.IconDisconnected);
 
-	// create window & do the message loop
+	// create window
 	ATOM Atom = RegisterClassExW(&WindowClass);
 	Assert(Atom);
 
@@ -1034,12 +1206,14 @@ void WinMainCRTStartup(void)
 		CW_USEDEFAULT, NULL, NULL, WindowClass.hInstance, NULL);
 	Assert(State.Window);
 
-	// start background thread for user list loading & websocket
-	State.ReloadEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
-	Assert(State.ReloadEvent);
-	HANDLE Thread = CreateThread(NULL, 0, &UpdateThread, NULL, 0, NULL);
+	// start background websocket thread
+	HANDLE Thread = CreateThread(NULL, 0, &WebsocketThread, NULL, 0, NULL);
 	Assert(Thread);
 
+	// load initial user list
+	LoadUsers();
+
+	// do the window message loop
 	for (;;)
 	{
 		MSG Message;

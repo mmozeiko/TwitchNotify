@@ -276,7 +276,7 @@ static void ShowUserNotification(User* User)
 	// use long duration, because getting game & stream name often takes a while
 	XmlLength = StrCatChainW(Xml, ARRAYSIZE(Xml), XmlLength,
 		L"<toast duration=\"long\"><visual><binding template=\"ToastGeneric\">"
-		L"<image placement=\"appLogoOverride\" src=\"");
+		L"<image placement=\"appLogoOverride\" src=\"file:///");
 	XmlLength = StrCatChainW(Xml, ARRAYSIZE(Xml), XmlLength, ImagePath);
 	XmlLength = StrCatChainW(Xml, ARRAYSIZE(Xml), XmlLength,
 		L"\"/>"
@@ -306,6 +306,22 @@ static void ShowUserNotification(User* User)
 	};
 	User->Notification = WindowsToast_Create(&State.Toast, Xml, XmlLength, Data, ARRAYSIZE(Data));
 	WindowsToast_Show(&State.Toast, User->Notification);
+}
+
+static void UpdateUserNotification(User* User, LPCWSTR GameName, LPCWSTR StreamName)
+{
+	if (User->Notification)
+	{
+		LPCWSTR Data[][2] =
+		{
+			{ L"game",   GameName   },
+			{ L"stream", StreamName },
+		};
+
+		WindowsToast_Update(&State.Toast, User->Notification, Data, ARRAYSIZE(Data));
+		WindowsToast_Release(&State.Toast, User->Notification);
+		User->Notification = NULL;
+	}
 }
 
 static void WebsocketPing(void)
@@ -582,11 +598,7 @@ static void LoadUsers(void)
 			{
 				WesocketListenUser(OldUser->UserId, FALSE);
 			}
-			if (OldUser->Notification)
-			{
-				WindowsToast_Release(&State.Toast, OldUser->Notification);
-				OldUser->Notification = NULL;
-			}
+			UpdateUserNotification(OldUser, L"", L"");
 		}
 	}
 
@@ -909,24 +921,17 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 
 				if (StreamName)
 				{
-					LPCWSTR Data[][2] =
-					{
-						{ L"game",   GameName   },
-						{ L"stream", StreamName },
-					};
-
-					if (User->Notification)
-					{
-						WindowsToast_Update(&State.Toast, User->Notification, Data, ARRAYSIZE(Data));
-						WindowsToast_Release(&State.Toast, User->Notification);
-						User->Notification = NULL;
-					}
+					UpdateUserNotification(User, GameName, StreamName);
 				}
 				else if (User->Notification != NULL) // if notification is still up
 				{
 					// cannot get user game & stream name
 					// retry a bit later - after 1 second
 					DownloadUserStream(UserId, 1000);
+				}
+				else
+				{
+					// notification was removed, nothing to do
 				}
 
 				JsonRelease(Game);

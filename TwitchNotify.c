@@ -327,7 +327,7 @@ static void UpdateUserNotification(User* User, LPCWSTR GameName, LPCWSTR StreamN
 static void WebsocketPing(void)
 {
 	char Data[] = "{\"type\":\"PING\"}";
-	WinHttpWebSocketSend(State.Websocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, Data, ARRAYSIZE(Data));
+	WinHttpWebSocketSend(State.Websocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, Data, ARRAYSIZE(Data) - 1);
 }
 
 static void WesocketListenUser(int UserId, BOOL Listen)

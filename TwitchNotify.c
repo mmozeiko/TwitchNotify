@@ -28,9 +28,10 @@
 #define WM_TWITCH_NOTIFY_COMMAND         (WM_USER + 1)
 #define WM_TWITCH_NOTIFY_ALREADY_RUNNING (WM_USER + 2)
 #define WM_TWITCH_NOTIFY_WEBSOCKET       (WM_USER + 3) // wparam=bool for connection status
-#define WM_TWITCH_NOTIFY_USER_STATUS     (WM_USER + 4) // wparam=UserId, lparam=viewer count, negative for disconnect
-#define WM_TWITCH_NOTIFY_USER_STREAM     (WM_USER + 5) // wparam=UserId, lparam=JsonObject for game & stream name
-#define WM_TWITCH_NOTIFY_USER_INFO       (WM_USER + 6) // wparam=JsonObject for user
+#define WM_TWITCH_NOTIFY_USER_STATUS     (WM_USER + 4) // wparam=UserId, lparam=true if connected
+#define WM_TWITCH_NOTIFY_USER_VIEW_COUNT (WM_USER + 5) // wparam=UserId, lparam=viewer count
+#define WM_TWITCH_NOTIFY_USER_STREAM     (WM_USER + 6) // wparam=UserId, lparam=JsonObject for game & stream name
+#define WM_TWITCH_NOTIFY_USER_INFO       (WM_USER + 7) // wparam=JsonObject for user
 
 #define CMD_OPEN_HOMEPAGE 10
 #define CMD_USE_MPV       20
@@ -879,28 +880,38 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 	else if (Message == WM_TWITCH_NOTIFY_USER_STATUS)
 	{
 		int UserId = (int)WParam;
+		BOOL Connected = (BOOL)LParam;
+		for (int Index = 0; Index < State.UserCount; Index++)
+		{
+			User* User = &State.Users[Index];
+			if (User->UserId == UserId)
+			{
+				if (Connected)
+				{
+					User->IsOnline = TRUE;
+					User->ViewerCount = 0;
+					ShowUserNotification(User);
+					DownloadUserStream(UserId, 0);
+				}
+				else
+				{
+					User->IsOnline = FALSE;
+				}
+				break;
+			}
+		}
+		return 0;
+	}
+	else if (Message == WM_TWITCH_NOTIFY_USER_VIEW_COUNT)
+	{
+		int UserId = (int)WParam;
 		int ViewerCount = (int)LParam;
 		for (int Index = 0; Index < State.UserCount; Index++)
 		{
 			User* User = &State.Users[Index];
 			if (User->UserId == UserId)
 			{
-				if (ViewerCount < 0)
-				{
-					User->IsOnline = FALSE;
-				}
-				else if (User->IsOnline)
-				{
-					// user is already online, just update viewer count
-					User->ViewerCount = ViewerCount;
-				}
-				else
-				{
-					User->IsOnline = TRUE;
-					User->ViewerCount = ViewerCount;
-					ShowUserNotification(User);
-					DownloadUserStream(UserId, 0);
-				}
+				User->ViewerCount = ViewerCount;
 				break;
 			}
 		}
@@ -1054,16 +1065,16 @@ static void WebsocketLoop(HINTERNET Websocket)
 						{
 							if (StrCmpW(Type, L"stream-up") == 0)
 							{
-								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STATUS, UserId, 0);
+								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STATUS, UserId, TRUE);
 							}
 							else if (StrCmpW(Type, L"stream-down") == 0)
 							{
-								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STATUS, UserId, -1);
+								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STATUS, UserId, FALSE);
 							}
 							else if (StrCmpW(Type, L"viewcount") == 0)
 							{
 								int ViewerCount = (int)JsonObject_GetNumber(Msg, JsonCSTR("viewers"));
-								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STATUS, UserId, ViewerCount);
+								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_VIEW_COUNT, UserId, ViewerCount);
 							}
 						}
 						JsonRelease(Msg);

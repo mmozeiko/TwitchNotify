@@ -6,6 +6,8 @@
 #include <shellapi.h>
 #include <shlwapi.h>
 #include <winhttp.h>
+#include <stdbool.h>
+#include <stdint.h>
 
 #pragma comment (lib, "kernel32.lib")
 #pragma comment (lib, "user32.lib")
@@ -25,37 +27,66 @@
 #include "WindowsToast.h"
 #include "WindowsJson.h"
 
-#define WM_TWITCH_NOTIFY_COMMAND         (WM_USER + 1)
-#define WM_TWITCH_NOTIFY_ALREADY_RUNNING (WM_USER + 2)
-#define WM_TWITCH_NOTIFY_WEBSOCKET       (WM_USER + 3) // wparam=bool for connection status
-#define WM_TWITCH_NOTIFY_USER_STATUS     (WM_USER + 4) // wparam=UserId, lparam=true if connected
-#define WM_TWITCH_NOTIFY_USER_VIEW_COUNT (WM_USER + 5) // wparam=UserId, lparam=viewer count
-#define WM_TWITCH_NOTIFY_USER_STREAM     (WM_USER + 6) // wparam=UserId, lparam=JsonObject for game & stream name
-#define WM_TWITCH_NOTIFY_USER_INFO       (WM_USER + 7) // wparam=JsonObject for user
+// sent when tray icon is clicked
+#define WM_TWITCH_NOTIFY_COMMAND (WM_USER + 1)
 
-#define CMD_OPEN_HOMEPAGE 10
-#define CMD_USE_MPV       20
-#define CMD_QUALITY       30
-#define CMD_EDIT_USERS    40
-#define CMD_EXIT          50
-#define CMD_USER          60 // should be last
+// sent from duplicate to original instance of application to show notification
+#define WM_TWITCH_NOTIFY_ALREADY_RUNNING (WM_USER + 2)
+
+// sent when websocket is connected or disconnected
+// WParam contains HINTERNET handle for websocket, or NULL when disconnected
+#define WM_TWITCH_NOTIFY_WEBSOCKET (WM_USER + 3)
+
+// sent when websocked receives live status update for user
+// WParam is UserId, LParam is true when user goes live, false when goes offline
+#define WM_TWITCH_NOTIFY_USER_STATUS (WM_USER + 4)
+
+// sent when websocket receives viewer count update
+// WParam is UserId, LParam is viewer count
+#define WM_TWITCH_NOTIFY_USER_VIEWER_COUNT (WM_USER + 5)
+
+// sent when game/stream name is downloaded
+// WParam is UserId, LParam is JsonObject for response (must release it)
+#define WM_TWITCH_NOTIFY_USER_STREAM (WM_USER + 6)
+
+// sent when initial user info is downloaded
+// WParam is JsonObject for response (must release it)
+#define WM_TWITCH_NOTIFY_USER_INFO (WM_USER + 7)
+
+// command id's for popup menu items
+#define CMD_OPEN_HOMEPAGE 10 // "Twitch Notify" item selected
+#define CMD_USE_MPV       20 // "Use mpv" checkbox
+#define CMD_QUALITY       30 // +N for Quality submenu items
+#define CMD_EDIT_USERS    40 // "Edit List" in user submenu
+#define CMD_EXIT          50 // "Exit"
+#define CMD_USER          60 // +N for one of users (indexed into State.Users[] array)
 
 #define TWITCH_NOTIFY_NAME     L"Twitch Notify"
 #define TWITCH_NOTIFY_INI      L"TwitchNotify.ini"
 #define TWITCH_NOTIFY_APPID    L"TwitchNotify.TwitchNotify" // CompanyName.ProductName
 #define TWITCH_NOTIFY_HOMEPAGE L"https://github.com/mmozeiko/TwitchNotify/"
 
-#define MAX_USER_COUNT    50 // oficially documented user count limit for Twitch websocket
+// Twitch oficially documented monitored user count is limited to 50
+#define MAX_USER_COUNT    50
+
+// just arbitrary limit for strings (most of them will be shorter anyway)
 #define MAX_STRING_LENGTH 256
 
-#define MAX_IMAGE_CACHE_AGE (60*60*24*7)  // 1 week in seconds
+// downloaded user profile image files will be cached
+// length in seconds, 1 week
+#define MAX_IMAGE_CACHE_AGE (60*60*24*7)
 
+// WM_TIMER id's
 #define TIMER_RELOAD_USERS 1
+#define TIMER_WEBSOCKET_PING 2
+
+// how much to delay after .ini file notification is detected
 #define TIMER_RELOAD_USERS_DELAY 100 // msec
 
-#define TIMER_WEBSOCKET_PING 2
-#define TIMER_WEBSOCKET_PING_INTERVAL (2*60*1000) // 2 minutes in msec, Twitch requires at least one ping per 5 minutes
+// Twitch requires to send PING message over websocket at least once per 5 min
+#define TIMER_WEBSOCKET_PING_INTERVAL (2*60*1000) // 2 min in msec
 
+// youtube-dl quality names to use with mpv player
 struct
 {
 	LPCWSTR Name;
@@ -73,20 +104,29 @@ static const Quality[] =
 	{ L"160p",       "best[height<=?160]/best"           },
 };
 
-// message sent when explorer.exe restarts, to restore tray icons
-static UINT WM_TASKBARCREATED;
+// message sent when explorer.exe restarts, to restore tray icon
+static uint32_t WM_TASKBARCREATED;
 
 typedef struct
 {
-	WCHAR Name[MAX_STRING_LENGTH];
-	WCHAR DisplayName[MAX_STRING_LENGTH];
-	WCHAR ImagePath[MAX_STRING_LENGTH];
+	WCHAR Name[MAX_STRING_LENGTH];        // name from .ini file, used for Twitch URL
+	WCHAR DisplayName[MAX_STRING_LENGTH]; // display name user can customize
+	WCHAR ImagePath[MAX_PATH];   // path to downloaded profile image
+
+	//  0 when user id is not yet known (gql query executing)
+	// -1 when gql query did not return any user (invalid username)
+	// >0 for actual users
 	int UserId;
 	int ViewerCount;
-	BOOL IsOnline;
+	bool IsLive;
+
+	// WindowsToast notification, keep it around to update it
 	void* Notification;
 } User;
 
+// global state of application
+// members are modified & accessed only from main thread
+// only exception is HWND Window - to post messages from background threads
 struct
 {
 	HICON Icon;
@@ -97,26 +137,25 @@ struct
 	HINTERNET Websocket;
 	PTP_POOL ThreadPool;
 
+	// for loading & saving .ini file
 	WCHAR IniPath[MAX_PATH];
 	FILETIME LastIniWriteTime;
 
-	BYTE ExeFolderChanges[4096];
-	OVERLAPPED ExeFolderOverlapped;
-	HANDLE ExeFolderHandle;
+	// global settings
+	int Quality;
+	bool UseMpv;
 
-	UINT Quality;
-	BOOL UseMpv;
-
+	// user list
 	User Users[MAX_USER_COUNT];
 	int UserCount;
 }
 static State;
 
 // http://www.isthe.com/chongo/tech/comp/fnv/
-static UINT64 GetFnv1Hash(const void* Ptr, int Size)
+static uint64_t GetFnv1Hash(const void* Ptr, int Size)
 {
-	const BYTE* Bytes = Ptr;
-	UINT64 Hash = 14695981039346656037ULL;
+	const uint8_t* Bytes = Ptr;
+	uint64_t Hash = 14695981039346656037ULL;
 	for (int Index = 0; Index < Size; Index++)
 	{
 		Hash *= 1099511628211ULL;
@@ -124,6 +163,8 @@ static UINT64 GetFnv1Hash(const void* Ptr, int Size)
 	}
 	return Hash;
 }
+
+// system tray icon stuff
 
 static void AddTrayIcon(HWND Window, HICON Icon)
 {
@@ -161,6 +202,7 @@ static void UpdateTrayIcon(HWND Window, HICON Icon)
 	Assert(Shell_NotifyIconW(NIM_MODIFY, &Data));
 }
 
+// InfoType can be: NIIF_NONE, NIIF_INFO, NIIF_WARNING, NIIF_ERROR
 static void ShowTrayMessage(HWND Window, DWORD InfoType, LPCWSTR Message)
 {
 	NOTIFYICONDATAW Data =
@@ -176,43 +218,7 @@ static void ShowTrayMessage(HWND Window, DWORD InfoType, LPCWSTR Message)
 	Assert(Shell_NotifyIconW(NIM_MODIFY, &Data));
 }
 
-static void WINAPI OnMonitorIniChanges(DWORD ErrorCode, DWORD NumberOfBytesTransfered, LPOVERLAPPED Overlapped)
-{
-	if (ErrorCode == ERROR_SUCCESS)
-	{
-		FILE_NOTIFY_INFORMATION* Info = (void*)State.ExeFolderChanges;
-
-		while ((char*)Info + sizeof(*Info) <= State.ExeFolderChanges + NumberOfBytesTransfered)
-		{
-			if (StrCmpNW(TWITCH_NOTIFY_INI, Info->FileName, Info->FileNameLength) == 0)
-			{
-				if (Info->Action == FILE_ACTION_REMOVED)
-				{
-					ShowTrayMessage(State.Window, NIIF_WARNING, L"Config file '" TWITCH_NOTIFY_NAME L"' deleted");
-				}
-				SetTimer(State.Window, TIMER_RELOAD_USERS, TIMER_RELOAD_USERS_DELAY, NULL);
-			}
-			if (Info->NextEntryOffset == 0)
-			{
-				break;
-			}
-			Info = (void*)((char*)Info + Info->NextEntryOffset);
-		}
-	}
-
-	BOOL Ok = ReadDirectoryChangesW(
-		State.ExeFolderHandle,
-		State.ExeFolderChanges,
-		ARRAYSIZE(State.ExeFolderChanges),
-		FALSE,
-		FILE_NOTIFY_CHANGE_FILE_NAME | FILE_NOTIFY_CHANGE_LAST_WRITE,
-		NULL,
-		&State.ExeFolderOverlapped,
-		NULL);
-	Assert(Ok);
-}
-
-static BOOL IsMpvInPath(void)
+static bool IsMpvInPath(void)
 {
 	WCHAR mpv[MAX_PATH];
 	return FindExecutableW(L"mpv.exe", NULL, mpv) > (HINSTANCE)32;
@@ -226,41 +232,49 @@ static void OpenMpvUrl(LPCWSTR Url)
 	ShellExecuteW(NULL, L"open", L"mpv.exe", Args, NULL, SW_SHOWNORMAL);
 }
 
+static void GetTwitchIcon(LPWSTR ImagePath)
+{
+	int TempLength = GetTempPathW(MAX_PATH, ImagePath);
+	Assert(TempLength);
+	wsprintfW(ImagePath + TempLength, L"twitch.png");
+
+	// if file does not exist
+	if (GetFileAttributesW(ImagePath) == INVALID_FILE_ATTRIBUTES)
+	{
+		// extract first icon image data from resources, it is a png file
+		HRSRC Resource = FindResourceW(NULL, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(3)); // 3=RT_ICON
+		if (Resource)
+		{
+			HGLOBAL Global = LoadResource(NULL, Resource);
+			if (Global)
+			{
+				int ResourceSize = SizeofResource(NULL, Resource);
+				LPVOID ResourceData = LockResource(Global);
+				if (ResourceData && ResourceSize)
+				{
+					HANDLE File = CreateFileW(ImagePath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+					if (File != INVALID_HANDLE_VALUE)
+					{
+						DWORD Written;
+						WriteFile(File, ResourceData, ResourceSize, &Written, NULL);
+						CloseHandle(File);
+					}
+				}
+			}
+		}
+	}
+}
+
+// showing & updating Windows Toast notification
+
 static void ShowUserNotification(User* User)
 {
 	WCHAR ImagePath[MAX_PATH];
 
 	if (GetFileAttributesW(User->ImagePath) == INVALID_FILE_ATTRIBUTES)
 	{
-		// in case image file is missing, use generic twitch image from our icon
-		DWORD TempLength = GetTempPathW(MAX_PATH, ImagePath);
-		Assert(TempLength);
-		wsprintfW(ImagePath + TempLength, L"twitch.png");
-
-		if (GetFileAttributesW(ImagePath) == INVALID_FILE_ATTRIBUTES)
-		{
-			// extract first icon image data from resources, it is a png file
-			HRSRC Resource = FindResourceW(NULL, MAKEINTRESOURCEW(1), MAKEINTRESOURCEW(3)); // 3=RT_ICON
-			if (Resource)
-			{
-				HGLOBAL Global = LoadResource(NULL, Resource);
-				if (Global)
-				{
-					DWORD ResourceSize = SizeofResource(NULL, Resource);
-					LPVOID ResourceData = LockResource(Global);
-					if (ResourceData && ResourceSize)
-					{
-						HANDLE File = CreateFileW(ImagePath, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-						if (File != INVALID_HANDLE_VALUE)
-						{
-							DWORD Written;
-							WriteFile(File, ResourceData, ResourceSize, &Written, NULL);
-							CloseHandle(File);
-						}
-					}
-				}
-			}
-		}
+		// unlikely, but in case image file is missing on disk, use generic Twitch image from our icon
+		GetTwitchIcon(ImagePath);
 	}
 	else
 	{
@@ -299,16 +313,20 @@ static void ShowUserNotification(User* User)
 		L"\"/>"
 		L"</actions></toast>");
 
+	// initial user notification does not have game & stream title yet
+	// show "..." while it will be downloading in background
 	LPCWSTR Data[][2] =
 	{
 		{ L"user",   User->DisplayName },
 		{ L"game",   L"..."            },
 		{ L"stream", L""               },
 	};
-	User->Notification = WindowsToast_Create(&State.Toast, Xml, XmlLength, Data, ARRAYSIZE(Data));
-	WindowsToast_Show(&State.Toast, User->Notification);
+	void* Notification = WindowsToast_Create(&State.Toast, Xml, XmlLength, Data, ARRAYSIZE(Data));
+	WindowsToast_Show(&State.Toast, Notification);
+	User->Notification = Notification;
 }
 
+// updates & releases user notification
 static void UpdateUserNotification(User* User, LPCWSTR GameName, LPCWSTR StreamName)
 {
 	if (User->Notification)
@@ -318,12 +336,15 @@ static void UpdateUserNotification(User* User, LPCWSTR GameName, LPCWSTR StreamN
 			{ L"game",   GameName   },
 			{ L"stream", StreamName },
 		};
-
 		WindowsToast_Update(&State.Toast, User->Notification, Data, ARRAYSIZE(Data));
 		WindowsToast_Release(&State.Toast, User->Notification);
 		User->Notification = NULL;
 	}
 }
+
+// websocket stuff that main thread sends to server
+// don't care if WinHttpWebSocketSend fails, because that means websocket is
+// disconnected, and it will reconnect in background anyway
 
 static void WebsocketPing(void)
 {
@@ -331,7 +352,7 @@ static void WebsocketPing(void)
 	WinHttpWebSocketSend(State.Websocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, Data, ARRAYSIZE(Data) - 1);
 }
 
-static void WesocketListenUser(int UserId, BOOL Listen)
+static void WesocketListenUser(int UserId, bool Listen)
 {
 	if (State.Websocket)
 	{
@@ -340,6 +361,8 @@ static void WesocketListenUser(int UserId, BOOL Listen)
 		WinHttpWebSocketSend(State.Websocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, Data, DataSize);
 	}
 }
+
+// gql query stuff, will be called from background threads
 
 static int DoGqlQuery(char* Query, int QuerySize, char* Buffer, int BufferSize)
 {
@@ -352,22 +375,25 @@ static int DoGqlQuery(char* Query, int QuerySize, char* Buffer, int BufferSize)
 		if (Request)
 		{
 			WCHAR Headers[] = L"Client-ID: kimne78kx3ncx6brgo4mv6wki5h1ko";
-			if (WinHttpSendRequest(Request, Headers, ARRAYSIZE(Headers) - 1, Query, QuerySize, QuerySize, 0) && WinHttpReceiveResponse(Request, NULL))
+			if (WinHttpSendRequest(Request, Headers, ARRAYSIZE(Headers) - 1, Query, QuerySize, QuerySize, 0) &&
+				WinHttpReceiveResponse(Request, NULL))
 			{
 				DWORD Status = 0;
 				DWORD StatusSize = sizeof(Status);
-				WinHttpQueryHeaders(Request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &Status, &StatusSize, WINHTTP_NO_HEADER_INDEX);
+				WinHttpQueryHeaders(
+					Request,
+					WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+					WINHTTP_HEADER_NAME_BY_INDEX,
+					&Status,
+					&StatusSize,
+					WINHTTP_NO_HEADER_INDEX);
 
 				if (Status == HTTP_STATUS_OK)
 				{
 					while (ReadSize < BufferSize)
 					{
 						DWORD Read;
-						if (!WinHttpReadData(Request, Buffer + ReadSize, BufferSize - ReadSize, &Read))
-						{
-							break;
-						}
-						if (Read == 0)
+						if (!WinHttpReadData(Request, Buffer + ReadSize, BufferSize - ReadSize, &Read) || Read == 0)
 						{
 							break;
 						}
@@ -383,17 +409,22 @@ static int DoGqlQuery(char* Query, int QuerySize, char* Buffer, int BufferSize)
 	return ReadSize;
 }
 
+// gets "unqiue" path on disk to image - do this by hashing image URL
+// image will be placed in %TEMP% folder
+
 static void GetImagePath(LPWSTR ImagePath, LPCWSTR ImageUrl)
 {
-	DWORD ImageUrlLength = lstrlenW(ImageUrl);
-	UINT64 Hash = GetFnv1Hash(ImageUrl, ImageUrlLength * sizeof(WCHAR));
+	int  ImageUrlLength = lstrlenW(ImageUrl);
+	uint64_t Hash = GetFnv1Hash(ImageUrl, ImageUrlLength * sizeof(WCHAR));
 
-	DWORD TempLength = GetTempPathW(MAX_PATH, ImagePath);
+	int TempLength = GetTempPathW(MAX_PATH, ImagePath);
 	Assert(TempLength);
 
 	LPWSTR Extension = StrRChrW(ImageUrl, ImageUrl + ImageUrlLength, L'.');
 	wsprintfW(ImagePath + TempLength, L"%016I64x%s", Hash, Extension);
 }
+
+// image downloading, happens in background thread
 
 static void CALLBACK DownloadUserImageWork(PTP_CALLBACK_INSTANCE Instance, PVOID Context, PTP_WORK Work)
 {
@@ -404,7 +435,6 @@ static void CALLBACK DownloadUserImageWork(PTP_CALLBACK_INSTANCE Instance, PVOID
 
 	WCHAR HostName[MAX_PATH];
 	WCHAR UrlPath[MAX_PATH];
-
 	URL_COMPONENTSW Url =
 	{
 		.dwStructSize = sizeof(Url),
@@ -419,17 +449,29 @@ static void CALLBACK DownloadUserImageWork(PTP_CALLBACK_INSTANCE Instance, PVOID
 		HINTERNET Connection = WinHttpConnect(State.Session, HostName, Url.nPort, 0);
 		if (Connection)
 		{
-			HINTERNET Request = WinHttpOpenRequest(Connection, L"GET", UrlPath, NULL, NULL, NULL, Url.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
+			HINTERNET Request = WinHttpOpenRequest(
+				Connection, L"GET", UrlPath, NULL,
+				NULL, NULL, Url.nScheme == INTERNET_SCHEME_HTTPS ? WINHTTP_FLAG_SECURE : 0);
 			if (Request)
 			{
-				if (WinHttpSendRequest(Request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) && WinHttpReceiveResponse(Request, NULL))
+				if (WinHttpSendRequest(Request, WINHTTP_NO_ADDITIONAL_HEADERS, 0, WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+					WinHttpReceiveResponse(Request, NULL))
 				{
 					DWORD Status = 0;
 					DWORD StatusSize = sizeof(Status);
-					WinHttpQueryHeaders(Request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_HEADER_NAME_BY_INDEX, &Status, &StatusSize, WINHTTP_NO_HEADER_INDEX);
+					WinHttpQueryHeaders(
+						Request,
+						WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+						WINHTTP_HEADER_NAME_BY_INDEX,
+						&Status,
+						&StatusSize,
+						WINHTTP_NO_HEADER_INDEX);
 
 					if (Status == HTTP_STATUS_OK)
 					{
+						// there's a minor race condition when user notification can show up
+						// before image file has finished downloading, but this will almost
+						// never happen, and it is such a minor issue, so... meh
 						HANDLE File = CreateFileW(ImagePath, GENERIC_WRITE, FILE_SHARE_READ, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
 						if (File != INVALID_HANDLE_VALUE)
 						{
@@ -459,6 +501,7 @@ static void CALLBACK DownloadUserImageWork(PTP_CALLBACK_INSTANCE Instance, PVOID
 	CloseThreadpoolWork(Work);
 }
 
+// called on main thread, gets path to profile image, and downloads it when necessary
 static void DownloadUserImage(LPWSTR ImagePath, LPCWSTR ImageUrl)
 {
 	GetImagePath(ImagePath, ImageUrl);
@@ -466,13 +509,15 @@ static void DownloadUserImage(LPWSTR ImagePath, LPCWSTR ImageUrl)
 	WIN32_FILE_ATTRIBUTE_DATA Data;
 	if (GetFileAttributesExW(ImagePath, GetFileExInfoStandard, &Data))
 	{
-		UINT64 LastWrite = (((UINT64)Data.ftLastWriteTime.dwHighDateTime) << 32) + Data.ftLastWriteTime.dwLowDateTime;
+		// FILETIME is in 100nsec units
+		uint64_t LastWrite =
+			(((uint64_t)Data.ftLastWriteTime.dwHighDateTime) << 32) + Data.ftLastWriteTime.dwLowDateTime;
 
 		FILETIME NowTime;
 		GetSystemTimeAsFileTime(&NowTime);
 
-		UINT64 Now = (((UINT64)NowTime.dwHighDateTime) << 32) + NowTime.dwLowDateTime;
-		UINT64 Expires = LastWrite + (UINT64)MAX_IMAGE_CACHE_AGE * 10 * 1000 * 1000;
+		uint64_t Now = (((uint64_t)NowTime.dwHighDateTime) << 32) + NowTime.dwLowDateTime;
+		uint64_t Expires = LastWrite + (uint64_t)MAX_IMAGE_CACHE_AGE * 10 * 1000 * 1000;
 		if (Now < Expires)
 		{
 			// ok image up to date
@@ -480,17 +525,20 @@ static void DownloadUserImage(LPWSTR ImagePath, LPCWSTR ImageUrl)
 		}
 	}
 
-	// queue downloading to background
+	// when image is not present or out of date, queue its download
 
 	TP_CALLBACK_ENVIRON Environ;
 	InitializeThreadpoolEnvironment(&Environ);
 	SetThreadpoolCallbackPool(&Environ, State.ThreadPool);
 
+	// NOTE: callback must LocalFree() passed context pointer
 	PTP_WORK Work = CreateThreadpoolWork(&DownloadUserImageWork, StrDupW(ImageUrl), &Environ);
 	Assert(Work);
 
 	SubmitThreadpoolWork(Work);
 }
+
+// gql query for getting initial user info (UserId & friends), happens in background thread
 
 static void CALLBACK DownloadUserInfoWork(PTP_CALLBACK_INSTANCE Instance, PVOID Context, PTP_WORK Work)
 {
@@ -501,43 +549,26 @@ static void CALLBACK DownloadUserInfoWork(PTP_CALLBACK_INSTANCE Instance, PVOID 
 	LocalFree(Query);
 
 	JsonObject* Json = JsonObject_Parse(Buffer, BufferSize);
-	JsonArray* Errors = JsonObject_GetArray(Json, JsonCSTR("errors"));
-	if (Errors)
-	{
-		JsonObject* ErrorMessage = JsonArray_GetObject(Errors, 0);
-		LPCWSTR Message = JsonObject_GetString(ErrorMessage, JsonCSTR("message"));
-		ShowTrayMessage(State.Window, NIIF_ERROR, Message);
-		JsonRelease(ErrorMessage);
-		JsonRelease(Errors);
-	}
-	else
-	{
-		JsonObject* Data = JsonObject_GetObject(Json, JsonCSTR("data"));
-		JsonArray* Users = JsonObject_GetArray(Data, JsonCSTR("users"));
-		JsonRelease(Data);
-
-		PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_INFO, (WPARAM)Users, 0);
-	}
-	JsonRelease(Json);
+	PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_INFO, (WPARAM)Json, 0);
 
 	CloseThreadpoolWork(Work);
 }
 
+// reloads .ini file if need & updates State.User[] array, must be called from main thread
 static void LoadUsers(void)
 {
 	WIN32_FILE_ATTRIBUTE_DATA Data;
 	if (!GetFileAttributesExW(State.IniPath, GetFileExInfoStandard, &Data))
 	{
-		// ini file deleted?
+		// .ini file deleted?
 		return;
 	}
 
 	if (CompareFileTime(&State.LastIniWriteTime, &Data.ftLastWriteTime) >= 0)
 	{
-		// ini file is up to date
+		// .ini file is up to date
 		return;
 	}
-
 	State.LastIniWriteTime = Data.ftLastWriteTime;
 
 	WCHAR Users[32768]; // max size GetPrivateProfileSection() can return
@@ -568,12 +599,12 @@ static void LoadUsers(void)
 		Ptr += PtrLength + 1;
 	}
 
+	// remember current user count
 	int OldCount = State.UserCount;
-
 	User OldUsers[MAX_USER_COUNT];
-	CopyMemory(OldUsers, State.Users, sizeof(User) * OldCount);
+	CopyMemory(OldUsers, State.Users, OldCount * sizeof(User));
 
-	// copy over existing users
+	// copy users back which have not changed
 	int UserCount = 0;
 	for (int OldIndex = 0; OldIndex < OldCount; OldIndex++)
 	{
@@ -582,6 +613,7 @@ static void LoadUsers(void)
 			if (StrCmpW(OldUsers[OldIndex].Name, NewUsers[NewIndex]) == 0)
 			{
 				State.Users[UserCount++] = OldUsers[OldIndex];
+
 				NewUsers[NewIndex] = NULL;
 				OldUsers[OldIndex].Name[0] = 0;
 				break;
@@ -597,8 +629,11 @@ static void LoadUsers(void)
 		{
 			if (OldUser->UserId > 0)
 			{
-				WesocketListenUser(OldUser->UserId, FALSE);
+				// unsubscribe from websocket notifications
+				WesocketListenUser(OldUser->UserId, false);
 			}
+			// in case notification game/stream title update was pending
+			// update it and release notification handle
 			UpdateUserNotification(OldUser, L"", L"");
 		}
 	}
@@ -617,10 +652,12 @@ static void LoadUsers(void)
 		{
 			User* User = &State.Users[UserCount++];
 			StrCpyNW(User->Name, NewUsers[NewIndex], MAX_STRING_LENGTH);
+
+			// this info is not known yet, will be downloaded in DownloadUserInfoWork callback
 			User->UserId = 0;
 			User->DisplayName[0] = 0;
-			User->ViewerCount = 0;
-			User->IsOnline = FALSE;
+
+			// no notification is shown initially
 			User->Notification = NULL;
 			
 			QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, Delim);
@@ -640,17 +677,20 @@ static void LoadUsers(void)
 	QuerySize = WideCharToMultiByte(CP_UTF8, 0, Query, QuerySize, QueryBytes, ARRAYSIZE(QueryBytes), NULL, NULL);
 	QueryBytes[QuerySize] = 0;
 
-	// queue downloading to background
+	// queue gql query to background
 
 	TP_CALLBACK_ENVIRON Environ;
 	InitializeThreadpoolEnvironment(&Environ);
 	SetThreadpoolCallbackPool(&Environ, State.ThreadPool);
 
+	// NOTE: callback must LocalFree() passed context pointer
 	PTP_WORK Work = CreateThreadpoolWork(&DownloadUserInfoWork, StrDupA(QueryBytes), &Environ);
 	Assert(Work);
 
 	SubmitThreadpoolWork(Work);
 }
+
+// gql query for getting user game/stream title, happens in background thread
 
 static void DownloadUserStreamCommon(int UserId)
 {
@@ -661,17 +701,7 @@ static void DownloadUserStreamCommon(int UserId)
 	int BufferSize = DoGqlQuery(Query, QuerySize, Buffer, sizeof(Buffer));
 
 	JsonObject* Json = BufferSize ? JsonObject_Parse(Buffer, BufferSize) : NULL;
-	JsonObject* Data = JsonObject_GetObject(Json, JsonCSTR("data"));
-	JsonArray* Users = JsonObject_GetArray(Data, JsonCSTR("users"));
-	JsonObject* UserData = JsonArray_GetObject(Users, 0);
-	JsonObject* Stream = JsonObject_GetObject(UserData, JsonCSTR("stream"));
-
-	PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STREAM, UserId, (LPARAM)Stream);
-
-	JsonRelease(UserData);
-	JsonRelease(Users);
-	JsonRelease(Data);
-	JsonRelease(Json);
+	PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STREAM, UserId, (LPARAM)Json);
 }
 
 static void CALLBACK DownloadUserStreamWork(PTP_CALLBACK_INSTANCE Instance, PVOID Context, PTP_WORK Work)
@@ -688,25 +718,22 @@ static void CALLBACK DownloadUserStreamTimer(PTP_CALLBACK_INSTANCE Instance, PVO
 	CloseThreadpoolTimer(Timer);
 }
 
+// issues gql query for getting user game/stream title, must be called from main thread
+// Delay is extra time to delay before actual download, in msec
 static void DownloadUserStream(int UserId, int Delay)
 {
+	TP_CALLBACK_ENVIRON Environ;
+	InitializeThreadpoolEnvironment(&Environ);
+	SetThreadpoolCallbackPool(&Environ, State.ThreadPool);
+
 	if (Delay == 0)
 	{
-		TP_CALLBACK_ENVIRON Environ;
-		InitializeThreadpoolEnvironment(&Environ);
-		SetThreadpoolCallbackPool(&Environ, State.ThreadPool);
-
 		PTP_WORK Work = CreateThreadpoolWork(&DownloadUserStreamWork, IntToPtr(UserId), &Environ);
 		Assert(Work);
-
 		SubmitThreadpoolWork(Work);
 	}
 	else
 	{
-		TP_CALLBACK_ENVIRON Environ;
-		InitializeThreadpoolEnvironment(&Environ);
-		SetThreadpoolCallbackPool(&Environ, State.ThreadPool);
-
 		PTP_TIMER Timer = CreateThreadpoolTimer(&DownloadUserStreamTimer, IntToPtr(UserId), &Environ);
 		Assert(Timer);
 
@@ -721,14 +748,309 @@ static void DownloadUserStream(int UserId, int Delay)
 	}
 }
 
+static void ShowTrayMenu(HWND Window)
+{
+	HMENU QualityMenu = CreatePopupMenu();
+	Assert(QualityMenu);
+
+	for (int Index = 0; Index < ARRAYSIZE(Quality); Index++)
+	{
+		UINT Flags = State.Quality == Index ? MF_CHECKED : MF_UNCHECKED;
+		AppendMenuW(QualityMenu, Flags, CMD_QUALITY + Index, Quality[Index].Name);
+	}
+
+	HMENU UsersMenu = CreatePopupMenu();
+	Assert(UsersMenu);
+
+	for (int Index = 0; Index < State.UserCount; Index++)
+	{
+		User* User = &State.Users[Index];
+		if (User->UserId > 0)
+		{
+			LPCWSTR Name = User->DisplayName[0] ? User->DisplayName : User->Name;
+			if (User->IsLive)
+			{
+				WCHAR Caption[1024];
+				wsprintfW(Caption, L"%s\t%d", Name, User->ViewerCount);
+				AppendMenuW(UsersMenu, MF_CHECKED, CMD_USER + Index, Caption);
+			}
+			else
+			{
+				AppendMenuW(UsersMenu, MF_STRING, CMD_USER + Index, Name);
+			}
+		}
+		else // unknown user
+		{
+			AppendMenuW(UsersMenu, MF_GRAYED, 0, User->Name);
+		}
+	}
+	if (State.UserCount == 0)
+	{
+		AppendMenuW(UsersMenu, MF_GRAYED, 0, L"No users");
+	}
+	AppendMenuW(UsersMenu, MF_SEPARATOR, 0, NULL);
+	AppendMenuW(UsersMenu, MF_STRING, CMD_EDIT_USERS, L"Edit List");
+
+	HMENU Menu = CreatePopupMenu();
+	Assert(Menu);
+
+	AppendMenuW(Menu, MF_STRING, CMD_OPEN_HOMEPAGE, L"Twitch Notify");
+	AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
+	AppendMenuW(Menu, State.UseMpv ? MF_CHECKED : MF_STRING, CMD_USE_MPV, L"Use mpv");
+	AppendMenuW(Menu, MF_POPUP, (UINT_PTR)QualityMenu, L"Quality");
+	AppendMenuW(Menu, MF_POPUP, (UINT_PTR)UsersMenu, L"Users");
+
+	AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
+	AppendMenuW(Menu, MF_STRING, CMD_EXIT, L"Exit");
+
+	POINT Mouse;
+	GetCursorPos(&Mouse);
+
+	SetForegroundWindow(Window);
+	int Command = TrackPopupMenu(Menu, TPM_RETURNCMD | TPM_NONOTIFY, Mouse.x, Mouse.y, 0, Window, NULL);
+	if (Command == CMD_OPEN_HOMEPAGE)
+	{
+		ShellExecuteW(NULL, L"open", TWITCH_NOTIFY_HOMEPAGE, NULL, NULL, SW_SHOWNORMAL);
+	}
+	else if (Command == CMD_USE_MPV)
+	{
+		State.UseMpv = !State.UseMpv;
+	}
+	else if (Command >= CMD_QUALITY && Command < CMD_QUALITY + ARRAYSIZE(Quality))
+	{
+		State.Quality = Command - CMD_QUALITY;
+	}
+	else if (Command == CMD_EDIT_USERS)
+	{
+		ShellExecuteW(NULL, L"edit", State.IniPath, NULL, NULL, SW_SHOWNORMAL);
+	}
+	else if (Command == CMD_EXIT)
+	{
+		DestroyWindow(Window);
+	}
+	else if (Command >= CMD_USER && Command < CMD_USER + State.UserCount)
+	{
+		User* User = &State.Users[Command - CMD_USER];
+
+		WCHAR Url[1024];
+		wsprintfW(Url, L"https://www.twitch.tv/%s", User->Name);
+
+		if (State.UseMpv && IsMpvInPath() && User->IsLive)
+		{
+			// use mpv only if mpv is selected, it is available in path, and user is live
+			OpenMpvUrl(Url);
+		}
+		else
+		{
+			// otherwise open browser url
+			ShellExecuteW(NULL, L"open", Url, NULL, NULL, SW_SHOWNORMAL);
+		}
+	}
+
+	DestroyMenu(Menu);
+	DestroyMenu(UsersMenu);
+	DestroyMenu(QualityMenu);
+}
+
+static void OnWebsocketConnected(HINTERNET Websocket)
+{
+	State.Websocket = Websocket;
+	UpdateTrayIcon(State.Window, Websocket ? State.Icon : State.IconDisconnected);
+
+	if (Websocket)
+	{
+		// if websocket is connected, start timer for sending PING messages
+		SetTimer(State.Window, TIMER_WEBSOCKET_PING, TIMER_WEBSOCKET_PING_INTERVAL, NULL);
+
+		// subscribe to all users with valid UserId
+		for (int Index = 0; Index < State.UserCount; Index++)
+		{
+			User* User = &State.Users[Index];
+			if (User->UserId > 0)
+			{
+				WesocketListenUser(User->UserId, true);
+			}
+		}
+	}
+	else
+	{
+		// when websocket is disconnected, stop PING message timer
+		KillTimer(State.Window, TIMER_WEBSOCKET_PING);
+	}
+}
+
+static User* GetUser(int UserId)
+{
+	for (int Index = 0; Index < State.UserCount; Index++)
+	{
+		User* User = &State.Users[Index];
+		if (User->UserId == UserId)
+		{
+			return User;
+		}
+	}
+	return NULL;
+}
+
+static void OnUserStatus(int UserId, bool IsLive)
+{
+	User* User = GetUser(UserId);
+	if (!User)
+	{
+		// no problem if user not found
+		// probably user list was edited right before websocket notification arrived
+		return;
+	}
+
+	if (IsLive)
+	{
+		// when user goes live
+		User->IsLive = true;
+
+		// show initial notification
+		ShowUserNotification(User);
+
+		// start download of game/stream title
+		DownloadUserStream(UserId, 0);
+	}
+	else
+	{
+		User->IsLive = false;
+
+		// in case notification game/stream title update was pending
+		// update it and release notification handle
+		UpdateUserNotification(User, L"", L"");
+	}
+}
+
+static void OnUserViewerCount(int UserId, int ViewerCount)
+{
+	User* User = GetUser(UserId);
+	if (!User)
+	{
+		// no problem if is user not found
+		// probably user list was edited right before websocket notification arrived
+		return;
+	}
+
+	User->ViewerCount = ViewerCount;
+}
+
+static void OnUserStream(int UserId, JsonObject* Json)
+{
+	User* User = GetUser(UserId);
+	if (!User)
+	{
+		// no problem if user is not found
+		// probably user list was edited right before gql download finished
+		return;
+	}
+
+	JsonObject* Data = JsonObject_GetObject(Json, JsonCSTR("data"));
+	JsonArray* Users = JsonObject_GetArray(Data, JsonCSTR("users"));
+	JsonObject* UserData = JsonArray_GetObject(Users, 0);
+	JsonObject* Stream = JsonObject_GetObject(UserData, JsonCSTR("stream"));
+	JsonObject* Game = JsonObject_GetObject(Stream, JsonCSTR("game"));
+	LPCWSTR GameName = JsonObject_GetString(Game, JsonCSTR("displayName"));
+	LPCWSTR StreamName = JsonObject_GetString(Stream, JsonCSTR("title"));
+
+	if (StreamName)
+	{
+		// if stream name is available in json response
+		// update notification with actual game/stream title
+		UpdateUserNotification(User, GameName, StreamName);
+	}
+	else
+	{
+		// cannot get user game/stream title
+		// if notification is still up then retry a bit later - after 1 second
+		if (User->Notification != NULL)
+		{
+			DownloadUserStream(UserId, 1000);
+		}
+	}
+
+	JsonRelease(Game);
+	JsonRelease(Stream);
+	JsonRelease(UserData);
+	JsonRelease(Users);
+	JsonRelease(Data);
+}
+
+static void OnUserInfo(JsonObject* Json)
+{
+	JsonArray* Errors = JsonObject_GetArray(Json, JsonCSTR("errors"));
+	if (Errors)
+	{
+		JsonObject* ErrorMessage = JsonArray_GetObject(Errors, 0);
+		LPCWSTR Message = JsonObject_GetString(ErrorMessage, JsonCSTR("message"));
+		ShowTrayMessage(State.Window, NIIF_ERROR, Message);
+		JsonRelease(ErrorMessage);
+		JsonRelease(Errors);
+		return;
+	}
+
+	JsonObject* Data = JsonObject_GetObject(Json, JsonCSTR("data"));
+	JsonArray* Users = JsonObject_GetArray(Data, JsonCSTR("users"));
+
+	// update all users that have UserId set to 0 - those are the ones
+	// for which gql query was downloaded
+
+	int UserIndex = 0;
+	int UsersCount = JsonArray_GetCount(Users);
+	for (int Index = 0; Index < UsersCount; Index++)
+	{
+		User* User = &State.Users[UserIndex];
+		while (User->UserId != 0)
+		{
+			User = &State.Users[++UserIndex];
+		}
+
+		JsonObject* UserData = JsonArray_GetObject(Users, Index);
+		if (UserData == NULL)
+		{
+			// user does not exist
+			User->UserId = -1;
+		}
+		else
+		{
+			LPCWSTR UserId = JsonObject_GetString(UserData, JsonCSTR("id"));
+			User->UserId = StrToIntW(UserId);
+
+			LPCWSTR DisplayName = JsonObject_GetString(UserData, JsonCSTR("displayName"));
+			StrCpyNW(User->DisplayName, DisplayName, MAX_STRING_LENGTH);
+
+			LPCWSTR ProfileImageUrl = JsonObject_GetString(UserData, JsonCSTR("profileImageURL"));
+			DownloadUserImage(User->ImagePath, ProfileImageUrl);
+
+			JsonObject* Stream = JsonObject_GetObject(UserData, JsonCSTR("stream"));
+			User->ViewerCount = (int)JsonObject_GetNumber(Stream, JsonCSTR("viewersCount"));
+
+			User->IsLive = Stream != NULL;
+
+			// subscribe to user live events on websocket
+			// if websocket is not connected yet, this subscription will
+			// happen on WM_TWITCH_NOTIFY_WEBSOCKET message
+			WesocketListenUser(User->UserId, true);
+
+			JsonRelease(Stream);
+			JsonRelease(UserData);
+		}
+	}
+	JsonRelease(Users);
+	JsonRelease(Data);
+}
+
 static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPARAM LParam)
 {
 	if (Message == WM_CREATE)
 	{
 		AddTrayIcon(Window, State.Icon); // initial icon will show up as connected, just to look prettier
-		OnMonitorIniChanges(-1, 0, NULL);
 		State.Quality = GetPrivateProfileIntW(L"player", L"quality", 0, State.IniPath);
 		State.UseMpv = GetPrivateProfileIntW(L"player", L"mpv", 1, State.IniPath);
+
+		// load initial user list
+		LoadUsers();
 		return 0;
 	}
 	else if (Message == WM_DESTROY)
@@ -745,108 +1067,9 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 		PostQuitMessage(0);
 		return 0;
 	}
-	else if (Message == WM_TWITCH_NOTIFY_COMMAND)
+	else if (Message == WM_TWITCH_NOTIFY_COMMAND && LParam == WM_RBUTTONUP)
 	{
-		if (LParam == WM_RBUTTONUP)
-		{
-			HMENU QualityMenu = CreatePopupMenu();
-			Assert(QualityMenu);
-
-			for (int Index = 0; Index < ARRAYSIZE(Quality); Index++)
-			{
-				AppendMenuW(QualityMenu, State.Quality == Index ? MF_CHECKED : MF_UNCHECKED, CMD_QUALITY + Index, Quality[Index].Name);
-			}
-
-			HMENU Users = CreatePopupMenu();
-			Assert(Users);
-
-			for (int Index = 0; Index < State.UserCount; Index++)
-			{
-				User* User = &State.Users[Index];
-				if (User->UserId > 0)
-				{
-					LPCWSTR Name = User->DisplayName[0] ? User->DisplayName : User->Name;
-					if (User->IsOnline)
-					{
-						WCHAR Caption[1024];
-						wsprintfW(Caption, L"%s\t%d", Name, User->ViewerCount);
-						AppendMenuW(Users, MF_CHECKED, CMD_USER + Index, Caption);
-					}
-					else
-					{
-						AppendMenuW(Users, MF_STRING, CMD_USER + Index, Name);
-					}
-				}
-				else // unknown user
-				{
-					AppendMenuW(Users, MF_GRAYED, 0, User->Name);
-				}
-			}
-			if (State.UserCount == 0)
-			{
-				AppendMenuW(Users, MF_GRAYED, 0, L"No users");
-			}
-			AppendMenuW(Users, MF_SEPARATOR, 0, NULL);
-			AppendMenuW(Users, MF_STRING, CMD_EDIT_USERS, L"Edit List");
-
-			HMENU Menu = CreatePopupMenu();
-			Assert(Menu);
-
-			AppendMenuW(Menu, MF_STRING, CMD_OPEN_HOMEPAGE, L"Twitch Notify");
-			AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
-			AppendMenuW(Menu, State.UseMpv ? MF_CHECKED : MF_STRING, CMD_USE_MPV, L"Use mpv");
-			AppendMenuW(Menu, MF_POPUP, (UINT_PTR)QualityMenu, L"Quality");
-			AppendMenuW(Menu, MF_POPUP, (UINT_PTR)Users, L"Users");
-
-			AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
-			AppendMenuW(Menu, MF_STRING, CMD_EXIT, L"Exit");
-
-			POINT Mouse;
-			GetCursorPos(&Mouse);
-
-			SetForegroundWindow(Window);
-			int Command = TrackPopupMenu(Menu, TPM_RETURNCMD | TPM_NONOTIFY, Mouse.x, Mouse.y, 0, Window, NULL);
-			if (Command == CMD_OPEN_HOMEPAGE)
-			{
-				ShellExecuteW(NULL, L"open", TWITCH_NOTIFY_HOMEPAGE, NULL, NULL, SW_SHOWNORMAL);
-			}
-			else if (Command == CMD_USE_MPV)
-			{
-				State.UseMpv = !State.UseMpv;
-			}
-			else if (Command >= CMD_QUALITY && Command < CMD_QUALITY + ARRAYSIZE(Quality))
-			{
-				State.Quality = Command - CMD_QUALITY;
-			}
-			else if (Command == CMD_EDIT_USERS)
-			{
-				ShellExecuteW(NULL, L"edit", State.IniPath, NULL, NULL, SW_SHOWNORMAL);
-			}
-			else if (Command == CMD_EXIT)
-			{
-				DestroyWindow(Window);
-			}
-			else if (Command >= CMD_USER && Command < CMD_USER + State.UserCount)
-			{
-				User* User = &State.Users[Command - CMD_USER];
-
-				WCHAR Url[1024];
-				wsprintfW(Url, L"https://www.twitch.tv/%s", User->Name);
-
-				if (State.UseMpv && IsMpvInPath() && User->IsOnline)
-				{
-					OpenMpvUrl(Url);
-				}
-				else
-				{
-					ShellExecuteW(NULL, L"open", Url, NULL, NULL, SW_SHOWNORMAL);
-				}
-			}
-
-			DestroyMenu(Menu);
-			DestroyMenu(Users);
-			DestroyMenu(QualityMenu);
-		}
+		ShowTrayMenu(Window);
 		return 0;
 	}
 	else if (Message == WM_TWITCH_NOTIFY_ALREADY_RUNNING)
@@ -856,143 +1079,42 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 	}
 	else if (Message == WM_TWITCH_NOTIFY_WEBSOCKET)
 	{
-		BOOL Connected = (BOOL)WParam;
-		UpdateTrayIcon(Window, Connected ? State.Icon : State.IconDisconnected);
-		if (Connected)
-		{
-			SetTimer(State.Window, TIMER_WEBSOCKET_PING, TIMER_WEBSOCKET_PING_INTERVAL, NULL);
-
-			for (int Index = 0; Index < State.UserCount; Index++)
-			{
-				User* User = &State.Users[Index];
-				if (User->UserId > 0)
-				{
-					WesocketListenUser(User->UserId, TRUE);
-				}
-			}
-		}
-		else
-		{
-			KillTimer(State.Window, TIMER_WEBSOCKET_PING);
-		}
+		// websocket connected or disconnected
+		HINTERNET Websocket = (HINTERNET)WParam;
+		OnWebsocketConnected(Websocket);
 		return 0;
 	}
 	else if (Message == WM_TWITCH_NOTIFY_USER_STATUS)
 	{
+		// received user live status update from websocket
 		int UserId = (int)WParam;
-		BOOL Connected = (BOOL)LParam;
-		for (int Index = 0; Index < State.UserCount; Index++)
-		{
-			User* User = &State.Users[Index];
-			if (User->UserId == UserId)
-			{
-				if (Connected)
-				{
-					User->IsOnline = TRUE;
-					User->ViewerCount = 0;
-					ShowUserNotification(User);
-					DownloadUserStream(UserId, 0);
-				}
-				else
-				{
-					User->IsOnline = FALSE;
-				}
-				break;
-			}
-		}
+		bool IsLive = (bool)LParam;
+		OnUserStatus(UserId, IsLive);
 		return 0;
 	}
-	else if (Message == WM_TWITCH_NOTIFY_USER_VIEW_COUNT)
+	else if (Message == WM_TWITCH_NOTIFY_USER_VIEWER_COUNT)
 	{
+		// received user viewer count update from websocket
 		int UserId = (int)WParam;
 		int ViewerCount = (int)LParam;
-		for (int Index = 0; Index < State.UserCount; Index++)
-		{
-			User* User = &State.Users[Index];
-			if (User->UserId == UserId)
-			{
-				User->ViewerCount = ViewerCount;
-				break;
-			}
-		}
+		OnUserViewerCount(UserId, ViewerCount);
 		return 0;
 	}
 	else if (Message == WM_TWITCH_NOTIFY_USER_STREAM)
 	{
+		// user game/stream title received from gql query
 		int UserId = (int)WParam;
-		JsonObject* Stream = (JsonObject*)LParam;
-		for (int Index = 0; Index < State.UserCount; Index++)
-		{
-			User* User = &State.Users[Index];
-			if (User->UserId == UserId)
-			{
-				JsonObject* Game = JsonObject_GetObject(Stream, JsonCSTR("game"));
-				LPCWSTR GameName = JsonObject_GetString(Game, JsonCSTR("displayName"));
-				LPCWSTR StreamName = JsonObject_GetString(Stream, JsonCSTR("title"));
-
-				if (StreamName)
-				{
-					UpdateUserNotification(User, GameName, StreamName);
-				}
-				else if (User->Notification != NULL) // if notification is still up
-				{
-					// cannot get user game & stream name
-					// retry a bit later - after 1 second
-					DownloadUserStream(UserId, 1000);
-				}
-				else
-				{
-					// notification was removed, nothing to do
-				}
-
-				JsonRelease(Game);
-				break;
-			}
-		}
-		JsonRelease(Stream);
+		JsonObject* Json = (JsonObject*)LParam;
+		OnUserStream(UserId, Json);
+		JsonRelease(Json);
 		return 0;
 	}
 	else if (Message == WM_TWITCH_NOTIFY_USER_INFO)
 	{
-		JsonArray* Users = (JsonArray*)WParam;
-
-		int UserIndex = 0;
-		int UsersCount = JsonArray_GetCount(Users);
-		for (int Index = 0; Index < UsersCount; Index++)
-		{
-			User* User = &State.Users[UserIndex];
-			while (User->UserId != 0)
-			{
-				User = &State.Users[++UserIndex];
-			}
-
-			JsonObject* UserData = JsonArray_GetObject(Users, Index);
-			if (UserData == NULL)
-			{
-				// user does not exist
-				User->UserId = -1;
-			}
-			else
-			{
-				LPCWSTR Id = JsonObject_GetString(UserData, JsonCSTR("id"));
-				LPCWSTR ProfileImageUrl = JsonObject_GetString(UserData, JsonCSTR("profileImageURL"));
-				LPCWSTR DisplayName = JsonObject_GetString(UserData, JsonCSTR("displayName"));
-
-				StrCpyNW(User->DisplayName, DisplayName, MAX_STRING_LENGTH);
-				DownloadUserImage(User->ImagePath, ProfileImageUrl);
-				User->UserId = StrToIntW(Id);
-
-				JsonObject* Stream = JsonObject_GetObject(UserData, JsonCSTR("stream"));
-				User->ViewerCount = (int)JsonObject_GetNumber(Stream, JsonCSTR("viewersCount"));
-				JsonRelease(Stream);
-
-				User->IsOnline = Stream != NULL;
-				WesocketListenUser(User->UserId, TRUE);
-
-				JsonRelease(UserData);
-			}
-		}
-		JsonRelease(Users);
+		// initial user info received from gql query
+		JsonObject* Json = (JsonObject*)WParam;
+		OnUserInfo(Json);
+		JsonRelease(Json);
 		return 0;
 	}
  	else if (Message == WM_TIMER)
@@ -1065,16 +1187,16 @@ static void WebsocketLoop(HINTERNET Websocket)
 						{
 							if (StrCmpW(Type, L"stream-up") == 0)
 							{
-								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STATUS, UserId, TRUE);
+								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STATUS, UserId, true);
 							}
 							else if (StrCmpW(Type, L"stream-down") == 0)
 							{
-								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STATUS, UserId, FALSE);
+								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STATUS, UserId, false);
 							}
 							else if (StrCmpW(Type, L"viewcount") == 0)
 							{
 								int ViewerCount = (int)JsonObject_GetNumber(Msg, JsonCSTR("viewers"));
-								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_VIEW_COUNT, UserId, ViewerCount);
+								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_VIEWER_COUNT, UserId, ViewerCount);
 							}
 						}
 						JsonRelease(Msg);
@@ -1087,7 +1209,7 @@ static void WebsocketLoop(HINTERNET Websocket)
 		}
 		else if (Type != WINHTTP_WEB_SOCKET_UTF8_FRAGMENT_BUFFER_TYPE)
 		{
-			// binary message type is not expected, disconnect
+			// other types of messages (binary/close) not expected here, just disconnect
 			break;
 		}
 	}
@@ -1096,9 +1218,9 @@ static void WebsocketLoop(HINTERNET Websocket)
 static DWORD WINAPI WebsocketThread(LPVOID Arg)
 {
 	// how much to delay between reconnection attempts
-	const DWORD DefaultDelay = 1000;  // 1 second default delay
-	const DWORD MaxDelay = 60 * 1000; // max delay = 1 minute
-	DWORD Delay = DefaultDelay;
+	const int DefaultDelay = 1000;  // 1 second default delay
+	const int MaxDelay = 60 * 1000; // max delay = 1 minute
+	int Delay = DefaultDelay;
 	for (;;)
 	{
 		HINTERNET Connection = WinHttpConnect(State.Session, L"pubsub-edge.twitch.tv", INTERNET_DEFAULT_HTTPS_PORT, 0);
@@ -1120,13 +1242,9 @@ static DWORD WINAPI WebsocketThread(LPVOID Arg)
 						Request = NULL;
 						Delay = DefaultDelay;
 
-						State.Websocket = Websocket;
-						PostMessageW(State.Window, WM_TWITCH_NOTIFY_WEBSOCKET, TRUE, 0);
-
+						PostMessageW(State.Window, WM_TWITCH_NOTIFY_WEBSOCKET, (WPARAM)Websocket, 0);
 						WebsocketLoop(Websocket);
-
-						State.Websocket = NULL;
-						PostMessageW(State.Window, WM_TWITCH_NOTIFY_WEBSOCKET, FALSE, 0);
+						PostMessageW(State.Window, WM_TWITCH_NOTIFY_WEBSOCKET, 0, 0);
 
 						WinHttpWebSocketClose(Websocket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
 						WinHttpCloseHandle(Websocket);
@@ -1146,7 +1264,7 @@ static DWORD WINAPI WebsocketThread(LPVOID Arg)
 	}
 }
 
-static void TwitchNotify_OnActivated(WindowsToast* Toast, void* Item, LPCWSTR Action)
+static void OnToastActivated(WindowsToast* Toast, void* Item, LPCWSTR Action)
 {
 	if (Action[0] == L'P')
 	{
@@ -1181,7 +1299,7 @@ void WinMainCRTStartup(void)
 	// initialize Windows Toast notifications
 	WindowsToast_Init(&State.Toast, TWITCH_NOTIFY_NAME, TWITCH_NOTIFY_APPID);
 	WindowsToast_HideAll(&State.Toast, TWITCH_NOTIFY_APPID);
-	State.Toast.OnActivatedCallback = TwitchNotify_OnActivated;
+	State.Toast.OnActivatedCallback = &OnToastActivated;
 
 	// initialize Windows HTTP Services
 	State.Session = WinHttpOpen(NULL, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
@@ -1200,10 +1318,8 @@ void WinMainCRTStartup(void)
 	PathCombineW(State.IniPath, ExeFolder, TWITCH_NOTIFY_INI);
 
 	// notifications on folder to monitor when ini file changes
-	State.ExeFolderHandle = CreateFileW(ExeFolder, FILE_LIST_DIRECTORY, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_WRITE, NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED, NULL);
-	Assert(State.ExeFolderHandle != INVALID_HANDLE_VALUE);
-	BOOL Ok = BindIoCompletionCallback(State.ExeFolderHandle, &OnMonitorIniChanges, 0);
-	Assert(Ok);
+	HANDLE ExeFolderHandle = FindFirstChangeNotificationW(ExeFolder, FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE);
+	Assert(ExeFolderHandle != INVALID_HANDLE_VALUE);
 
 	// load tray icons
 	State.Icon = LoadIconW(GetModuleHandleW(NULL), MAKEINTRESOURCEW(1));
@@ -1226,18 +1342,34 @@ void WinMainCRTStartup(void)
 	HANDLE Thread = CreateThread(NULL, 0, &WebsocketThread, NULL, 0, NULL);
 	Assert(Thread);
 
-	// load initial user list
-	LoadUsers();
-
 	// do the window message loop
 	for (;;)
 	{
-		MSG Message;
-		if (GetMessageW(&Message, NULL, 0, 0) <= 0)
+		DWORD Wait = MsgWaitForMultipleObjects(1, &ExeFolderHandle, FALSE, INFINITE, QS_ALLINPUT);
+		if (Wait == WAIT_OBJECT_0)
 		{
-			ExitProcess(0);
+			// start timer to reload .ini file, if file will be
+			// modified again (Ctrl+S pressed 2x fast) then timer will reset
+			SetTimer(State.Window, TIMER_RELOAD_USERS, TIMER_RELOAD_USERS_DELAY, NULL);
+
+			Assert(FindNextChangeNotification(ExeFolderHandle));
 		}
-		TranslateMessage(&Message);
-		DispatchMessageW(&Message);
+		else if (Wait == WAIT_OBJECT_0 + 1)
+		{
+			MSG Message;
+			while (PeekMessageW(&Message, NULL, 0, 0, PM_REMOVE))
+			{
+				if (Message.message == WM_QUIT)
+				{
+					ExitProcess(0);
+				}
+				TranslateMessage(&Message);
+				DispatchMessageW(&Message);
+			}
+		}
+		else
+		{
+			Assert(false);
+		}
 	}
 }

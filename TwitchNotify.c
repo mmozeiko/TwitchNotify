@@ -951,14 +951,16 @@ static void OnUserStream(int UserId, JsonObject* Json)
 	JsonObject* UserData = JsonArray_GetObject(Users, 0);
 	JsonObject* Stream = JsonObject_GetObject(UserData, JsonCSTR("stream"));
 	JsonObject* Game = JsonObject_GetObject(Stream, JsonCSTR("game"));
-	LPCWSTR GameName = JsonObject_GetString(Game, JsonCSTR("displayName"));
-	LPCWSTR StreamName = JsonObject_GetString(Stream, JsonCSTR("title"));
+	HSTRING GameName = JsonObject_GetString(Game, JsonCSTR("displayName"));
+	HSTRING StreamName = JsonObject_GetString(Stream, JsonCSTR("title"));
 
 	if (StreamName)
 	{
 		// if stream name is available in json response
 		// update notification with actual game/stream title
-		UpdateUserNotification(User, GameName, StreamName);
+		LPCWSTR GameNameStr = WindowsGetStringRawBuffer(GameName, NULL);
+		LPCWSTR StreamNameStr = WindowsGetStringRawBuffer(StreamName, NULL);
+		UpdateUserNotification(User, GameNameStr, StreamNameStr);
 	}
 	else
 	{
@@ -970,6 +972,8 @@ static void OnUserStream(int UserId, JsonObject* Json)
 		}
 	}
 
+	WindowsDeleteString(StreamName);
+	WindowsDeleteString(GameName);
 	JsonRelease(Game);
 	JsonRelease(Stream);
 	JsonRelease(UserData);
@@ -983,8 +987,9 @@ static void OnUserInfo(JsonObject* Json)
 	if (Errors)
 	{
 		JsonObject* ErrorMessage = JsonArray_GetObject(Errors, 0);
-		LPCWSTR Message = JsonObject_GetString(ErrorMessage, JsonCSTR("message"));
-		ShowTrayMessage(State.Window, NIIF_ERROR, Message);
+		HSTRING Message = JsonObject_GetString(ErrorMessage, JsonCSTR("message"));
+		ShowTrayMessage(State.Window, NIIF_ERROR, WindowsGetStringRawBuffer(Message, NULL));
+		WindowsDeleteString(Message);
 		JsonRelease(ErrorMessage);
 		JsonRelease(Errors);
 		return;
@@ -1014,14 +1019,14 @@ static void OnUserInfo(JsonObject* Json)
 		}
 		else
 		{
-			LPCWSTR UserId = JsonObject_GetString(UserData, JsonCSTR("id"));
-			User->UserId = StrToIntW(UserId);
+			HSTRING UserId = JsonObject_GetString(UserData, JsonCSTR("id"));
+			User->UserId = StrToIntW(WindowsGetStringRawBuffer(UserId, NULL));
 
-			LPCWSTR DisplayName = JsonObject_GetString(UserData, JsonCSTR("displayName"));
-			StrCpyNW(User->DisplayName, DisplayName, MAX_STRING_LENGTH);
+			HSTRING DisplayName = JsonObject_GetString(UserData, JsonCSTR("displayName"));
+			StrCpyNW(User->DisplayName, WindowsGetStringRawBuffer(DisplayName, NULL), MAX_STRING_LENGTH);
 
-			LPCWSTR ProfileImageUrl = JsonObject_GetString(UserData, JsonCSTR("profileImageURL"));
-			DownloadUserImage(User->ImagePath, ProfileImageUrl);
+			HSTRING ProfileImageUrl = JsonObject_GetString(UserData, JsonCSTR("profileImageURL"));
+			DownloadUserImage(User->ImagePath, WindowsGetStringRawBuffer(ProfileImageUrl, NULL));
 
 			JsonObject* Stream = JsonObject_GetObject(UserData, JsonCSTR("stream"));
 			User->ViewerCount = (int)JsonObject_GetNumber(Stream, JsonCSTR("viewersCount"));
@@ -1033,6 +1038,9 @@ static void OnUserInfo(JsonObject* Json)
 			// happen on WM_TWITCH_NOTIFY_WEBSOCKET message
 			WesocketListenUser(User->UserId, true);
 
+			WindowsDeleteString(UserId);
+			WindowsDeleteString(DisplayName);
+			WindowsDeleteString(ProfileImageUrl);
 			JsonRelease(Stream);
 			JsonRelease(UserData);
 		}
@@ -1169,40 +1177,47 @@ static void WebsocketLoop(HINTERNET Websocket)
 			JsonObject* Json = JsonObject_Parse(Buffer, BufferSize);
 			if (Json)
 			{
-				LPCWSTR JsonType = JsonObject_GetString(Json, JsonCSTR("type"));
-				if (StrCmpW(JsonType, L"MESSAGE") == 0)
+				HSTRING JsonType = JsonObject_GetString(Json, JsonCSTR("type"));
+				if (StrCmpW(WindowsGetStringRawBuffer(JsonType, NULL), L"MESSAGE") == 0)
 				{
 					JsonObject* Data = JsonObject_GetObject(Json, JsonCSTR("data"));
 
-					LPCWSTR Topic = JsonObject_GetString(Data, JsonCSTR("topic"));
-					LPCWSTR TopicLast = Topic ? StrRChrW(Topic, NULL, L'.') : NULL;
+					HSTRING Topic = JsonObject_GetString(Data, JsonCSTR("topic"));
+					UINT32 TopicLen;
+					LPCWSTR TopicStr = WindowsGetStringRawBuffer(Topic, &TopicLen);
+					LPCWSTR TopicLast = Topic ? StrRChrW(TopicStr, TopicStr + TopicLen, L'.') : NULL;
 					int UserId = TopicLast ? StrToIntW(TopicLast + 1) : 0;
 
-					LPCWSTR Message = JsonObject_GetString(Data, JsonCSTR("message"));
+					HSTRING Message = JsonObject_GetString(Data, JsonCSTR("message"));
 					if (Message && UserId)
 					{
-						JsonObject* Msg = JsonObject_ParseW(Message, -1);
-						LPCWSTR Type = JsonObject_GetString(Msg, JsonCSTR("type"));
-						if (Type)
+						JsonObject* Msg = JsonObject_ParseStr(Message);
+						HSTRING Type = JsonObject_GetString(Msg, JsonCSTR("type"));
+						LPCWSTR TypeStr = WindowsGetStringRawBuffer(Type, NULL);
+						if (TypeStr)
 						{
-							if (StrCmpW(Type, L"stream-up") == 0)
+							if (StrCmpW(TypeStr, L"stream-up") == 0)
 							{
 								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STATUS, UserId, true);
 							}
-							else if (StrCmpW(Type, L"stream-down") == 0)
+							else if (StrCmpW(TypeStr, L"stream-down") == 0)
 							{
 								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STATUS, UserId, false);
 							}
-							else if (StrCmpW(Type, L"viewcount") == 0)
+							else if (StrCmpW(TypeStr, L"viewcount") == 0)
 							{
 								int ViewerCount = (int)JsonObject_GetNumber(Msg, JsonCSTR("viewers"));
 								PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_VIEWER_COUNT, UserId, ViewerCount);
 							}
 						}
+						WindowsDeleteString(Type);
 						JsonRelease(Msg);
 					}
+					WindowsDeleteString(Message);
+					WindowsDeleteString(Topic);
 					JsonRelease(Data);
 				}
+				WindowsDeleteString(JsonType);
 				JsonRelease(Json);
 			}
 			BufferSize = 0;

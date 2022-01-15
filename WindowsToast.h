@@ -42,7 +42,7 @@ static void WindowsToast_HideAll(WindowsToast* Toast, LPCWSTR AppId);
 // https://docs.microsoft.com/en-us/uwp/schemas/tiles/toastschema/schema-root
 
 // pass -1 for XmlLength if Xml string is 0 terminated
-static void WindowsToast_ShowSimple(WindowsToast* Toast, LPCWSTR Xml, int XmlLength);
+static void WindowsToast_ShowSimple(WindowsToast* Toast, LPCWSTR Xml, int XmlLength, LPCWSTR(*Data)[2], UINT32 Count);
 
 static void* WindowsToast_Create(WindowsToast* Toast, LPCWSTR Xml, int XmlLength, LPCWSTR (*Data)[2], UINT32 Count);
 static void WindowsToast_Show(WindowsToast* Toast, void* Item);
@@ -128,8 +128,10 @@ static HRESULT STDMETHODCALLTYPE WindowsToast__OnActivated_Invoke(__FITypedEvent
 
 		HSTRING ArgString;
 		HR(__x_ABI_CWindows_CUI_CNotifications_CIToastActivatedEventArgs_get_Arguments(EventArgs, &ArgString));
-
 		Toast->OnActivatedCallback(Toast, Sender, WindowsGetStringRawBuffer(ArgString, NULL));
+		WindowsDeleteString(ArgString);
+
+		__x_ABI_CWindows_CUI_CNotifications_CIToastActivatedEventArgs_Release(EventArgs);
 	}
 	return S_OK;
 }
@@ -502,9 +504,9 @@ static void WindowsToast_Done(WindowsToast* Toast)
 	__x_ABI_CWindows_CUI_CNotifications_CINotificationDataFactory_Release(Toast->DataFactory);
 }
 
-static void WindowsToast_ShowSimple(WindowsToast* Toast, LPCWSTR Xml, int XmlLength)
+static void WindowsToast_ShowSimple(WindowsToast* Toast, LPCWSTR Xml, int XmlLength, LPCWSTR(*Data)[2], UINT32 Count)
 {
-	void* Item = WindowsToast_Create(Toast, Xml, XmlLength, NULL, 0);
+	void* Item = WindowsToast_Create(Toast, Xml, XmlLength, Data, Count);
 	WindowsToast_Show(Toast, Item);
 	WindowsToast_Release(Toast, Item);
 }
@@ -517,7 +519,7 @@ static void* WindowsToast_Create(WindowsToast* Toast, LPCWSTR Xml, int XmlLength
 	__x_ABI_CWindows_CData_CXml_CDom_CIXmlDocumentIO* XmlIO;
 	HR(__x_ABI_CWindows_CData_CXml_CDom_CIXmlDocument_QueryInterface(XmlDocument, &IID_IXmlDocumentIO, &XmlIO));
 
-	WindowsToastHSTRING XmlString = { 1, XmlLength >= 0 ? XmlLength : lstrlenW(Xml), 0, 0, Xml };
+	WindowsToastHSTRING XmlString = { 1, XmlLength < 0 ? lstrlenW(Xml) : XmlLength, 0, 0, Xml };
 	HR(__x_ABI_CWindows_CData_CXml_CDom_CIXmlDocumentIO_LoadXml(XmlIO, (HSTRING)&XmlString));
 	
 	__x_ABI_CWindows_CUI_CNotifications_CIToastNotification* Notification;

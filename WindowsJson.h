@@ -16,17 +16,18 @@ typedef __x_ABI_CWindows_CData_CJson_CIJsonArray  JsonArray;
 // if zero terminated, can set Length to -1
 static JsonObject* JsonObject_Parse(LPCSTR String, int Length);
 static JsonObject* JsonObject_ParseW(LPCWSTR String, int Length);
+static JsonObject* JsonObject_ParseStr(HSTRING String);
 
 static JsonObject* JsonObject_GetObject (JsonObject* Object, HSTRING Name);
 static JsonArray*  JsonObject_GetArray  (JsonObject* Object, HSTRING Name);
-static LPCWSTR     JsonObject_GetString (JsonObject* Object, HSTRING Name);
+static HSTRING     JsonObject_GetString (JsonObject* Object, HSTRING Name);
 static double      JsonObject_GetNumber (JsonObject* Object, HSTRING Name);
 static boolean     JsonObject_GetBoolean(JsonObject* Object, HSTRING Name);
 
 static UINT32      JsonArray_GetCount  (JsonArray* Array);
 static JsonObject* JsonArray_GetObject (JsonArray* Array, UINT32 Index);
 static JsonArray*  JsonArray_GetArray  (JsonArray* Array, UINT32 Index);
-static LPCWSTR     JsonArray_GetString (JsonArray* Array, UINT32 Index);
+static HSTRING     JsonArray_GetString (JsonArray* Array, UINT32 Index);
 static double      JsonArray_GetNumber (JsonArray* Array, UINT32 Index);
 static boolean     JsonArray_GetBoolean(JsonArray* Array, UINT32 Index);
 
@@ -53,6 +54,7 @@ DEFINE_GUID(IID_IVector_IJsonValue, 0xd44662bc, 0xdce3, 0x59a8, 0x92, 0x72, 0x4b
 
 JsonObject* JsonObject_Parse(LPCSTR String, int Length)
 {
+	if (Length < 0) Length = lstrlenA(String);
 	int WideLength = MultiByteToWideChar(CP_UTF8, 0, String, Length, NULL, 0);
 	Assert(WideLength != 0);
 
@@ -68,14 +70,18 @@ JsonObject* JsonObject_Parse(LPCSTR String, int Length)
 
 JsonObject* JsonObject_ParseW(LPCWSTR String, int Length)
 {
-	JsonHSTRING WideString = { 1, Length >= 0 ? Length : lstrlenW(String), 0, 0, String };
+	JsonHSTRING WideString = { 1, Length < 0 ? lstrlenW(String) : Length, 0, 0, String };
+	return JsonObject_ParseStr((HSTRING)&WideString);
+}
 
+JsonObject* JsonObject_ParseStr(HSTRING String)
+{
 	__x_ABI_CWindows_CData_CJson_CIJsonObjectStatics* ObjectStatics;
 	HR(RoGetActivationFactory(JsonCSTR("Windows.Data.Json.JsonObject"), &IID_IJsonObject, &ObjectStatics));
 
 	JsonObject* Object;
 	HRESULT hr;
-	if (FAILED(hr = __x_ABI_CWindows_CData_CJson_CIJsonObjectStatics_Parse(ObjectStatics, (HSTRING)&WideString, &Object)))
+	if (FAILED(hr = __x_ABI_CWindows_CData_CJson_CIJsonObjectStatics_Parse(ObjectStatics, String, &Object)))
 	{
 		Object = NULL;
 	}
@@ -104,14 +110,14 @@ JsonArray* JsonObject_GetArray(JsonObject* Object, HSTRING Name)
 	return Result;
 }
 
-LPCWSTR JsonObject_GetString(JsonObject* Object, HSTRING Name)
+HSTRING JsonObject_GetString(JsonObject* Object, HSTRING Name)
 {
 	HSTRING Result;
 	if (!Object || FAILED(__x_ABI_CWindows_CData_CJson_CIJsonObject_GetNamedString(Object, Name, &Result)))
 	{
 		Result = NULL;
 	}
-	return Result ? WindowsGetStringRawBuffer(Result, NULL) : NULL;
+	return Result;
 }
 
 double JsonObject_GetNumber(JsonObject* Object, HSTRING Name)
@@ -174,14 +180,14 @@ JsonArray* JsonArray_GetArray(JsonArray* Array, UINT32 Index)
 	return Result;
 }
 
-LPCWSTR JsonArray_GetString(JsonArray* Array, UINT32 Index)
+HSTRING JsonArray_GetString(JsonArray* Array, UINT32 Index)
 {
 	HSTRING Result;
 	if (!Array || FAILED(__x_ABI_CWindows_CData_CJson_CIJsonArray_GetStringAt(Array, Index, &Result)))
 	{
 		Result = NULL;
 	}
-	return Result ? WindowsGetStringRawBuffer(Result, NULL) : NULL;
+	return Result;
 }
 
 double JsonArray_GetNumber(JsonArray* Array, UINT32 Index)

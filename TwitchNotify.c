@@ -1296,6 +1296,9 @@ void WinMainCRTStartup(void)
 		ExitProcess(0);
 	}
 
+	// initialize Windows Runtime
+	HR(RoInitialize(RO_INIT_SINGLETHREADED));
+
 	// initialize Windows Toast notifications
 	WindowsToast_Init(&State.Toast, TWITCH_NOTIFY_NAME, TWITCH_NOTIFY_APPID);
 	WindowsToast_HideAll(&State.Toast, TWITCH_NOTIFY_APPID);

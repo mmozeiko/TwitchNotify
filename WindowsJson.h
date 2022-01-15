@@ -11,6 +11,8 @@ typedef __x_ABI_CWindows_CData_CJson_CIJsonArray  JsonArray;
 #define JsonCSTR(Name) (HSTRING)&(JsonHSTRING){ 1, sizeof(Name) - 1, 0, 0, L ## Name }
 #define JsonRelease(Obj) do { if (Obj) IUnknown_Release((IUnknown*)Obj); } while (0)
 
+// NOTE: make sure you have called RoInitialize() before using any of functions
+
 // if zero terminated, can set Length to -1
 static JsonObject* JsonObject_Parse(LPCSTR String, int Length);
 static JsonObject* JsonObject_ParseW(LPCWSTR String, int Length);

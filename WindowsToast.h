@@ -27,6 +27,8 @@ struct WindowsToast
 	__FITypedEventHandler_2_Windows__CUI__CNotifications__CToastNotification_Windows__CUI__CNotifications__CToastDismissedEventArgs OnDismissed;
 };
 
+// NOTE: make sure you have called RoInitialize() before using any of functions
+
 // AppId is in form of "CompanyName.ProductName"
 static void WindowsToast_Init(WindowsToast* Toast, LPCWSTR AppName, LPCWSTR AppId);
 static void WindowsToast_Done(WindowsToast* Toast);
@@ -396,8 +398,6 @@ static __x_ABI_CWindows_CUI_CNotifications_CINotificationData* WindowsToast__Cre
 
 static void WindowsToast_Init(WindowsToast* Toast, LPCWSTR AppName, LPCWSTR AppId)
 {
-	// initialize Windows Runtime
-	HR(RoInitialize(RO_INIT_MULTITHREADED));
 	HR(SetCurrentProcessExplicitAppUserModelID(AppId));
 
 	// create Toast objects
@@ -500,8 +500,6 @@ static void WindowsToast_Done(WindowsToast* Toast)
 	__x_ABI_CWindows_CUI_CNotifications_CIToastNotificationManagerStatics_Release(Toast->ManagerStatics);
 	__x_ABI_CWindows_CUI_CNotifications_CIToastNotificationFactory_Release(Toast->NotificationFactory);
 	__x_ABI_CWindows_CUI_CNotifications_CINotificationDataFactory_Release(Toast->DataFactory);
-
-	RoUninitialize();
 }
 
 static void WindowsToast_ShowSimple(WindowsToast* Toast, LPCWSTR Xml, int XmlLength)

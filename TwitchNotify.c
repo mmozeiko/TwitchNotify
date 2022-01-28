@@ -794,10 +794,12 @@ static void ShowTrayMenu(HWND Window)
 	HMENU Menu = CreatePopupMenu();
 	Assert(Menu);
 
+	bool MpvFound = IsMpvInPath();
+
 	AppendMenuW(Menu, MF_STRING, CMD_OPEN_HOMEPAGE, L"Twitch Notify");
 	AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
-	AppendMenuW(Menu, State.UseMpv ? MF_CHECKED : MF_STRING, CMD_USE_MPV, L"Use mpv");
-	AppendMenuW(Menu, MF_POPUP, (UINT_PTR)QualityMenu, L"Quality");
+	AppendMenuW(Menu, (State.UseMpv ? MF_CHECKED : MF_STRING) | (MpvFound ? 0 : MF_GRAYED), CMD_USE_MPV, L"Use mpv");
+	AppendMenuW(Menu, MF_POPUP | (MpvFound ? 0 : MF_GRAYED), (UINT_PTR)QualityMenu, L"Quality");
 	AppendMenuW(Menu, MF_POPUP, (UINT_PTR)UsersMenu, L"Users");
 
 	AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);

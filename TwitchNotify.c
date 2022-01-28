@@ -53,13 +53,18 @@
 // WParam is JsonObject for response (must release it)
 #define WM_TWITCH_NOTIFY_USER_INFO (WM_USER + 7)
 
+// sent when list of followed users is download
+// WParam is JsonObject for response (must release it)
+#define WM_TWITCH_NOTIFY_FOLLOWED_USERS (WM_USER + 8)
+
 // command id's for popup menu items
-#define CMD_OPEN_HOMEPAGE 10 // "Twitch Notify" item selected
-#define CMD_USE_MPV       20 // "Use mpv" checkbox
-#define CMD_QUALITY       30 // +N for Quality submenu items
-#define CMD_EDIT_USERS    40 // "Edit List" in user submenu
-#define CMD_EXIT          50 // "Exit"
-#define CMD_USER          60 // +N for one of users (indexed into State.Users[] array)
+#define CMD_OPEN_HOMEPAGE  10 // "Twitch Notify" item selected
+#define CMD_USE_MPV        20 // "Use mpv" checkbox
+#define CMD_QUALITY        30 // +N for Quality submenu items
+#define CMD_EDIT_USERS     40 // "Edit List" in user submenu
+#define CMD_DOWNLOAD_USERS 50 // "Download List" in user submenu
+#define CMD_EXIT           60 // "Exit"
+#define CMD_USER           70 // +N for one of users (indexed into State.Users[] array)
 
 #define TWITCH_NOTIFY_NAME     L"Twitch Notify"
 #define TWITCH_NOTIFY_INI      L"TwitchNotify.ini"
@@ -690,6 +695,67 @@ static void LoadUsers(void)
 	SubmitThreadpoolWork(Work);
 }
 
+// gql query for getting list of followed usernames, happens in background thread
+
+static void CALLBACK DownloadFollowedUsersWork(PTP_CALLBACK_INSTANCE Instance, PVOID Context, PTP_WORK Work)
+{
+	char* Query = (char*)Context;
+
+	char Buffer[65536];
+	int BufferSize = DoGqlQuery(Query, lstrlenA(Query), Buffer, sizeof(Buffer));
+	LocalFree(Query);
+
+	JsonObject* Json = JsonObject_Parse(Buffer, BufferSize);
+	PostMessageW(State.Window, WM_TWITCH_NOTIFY_FOLLOWED_USERS, (WPARAM)Json, 0);
+
+	CloseThreadpoolWork(Work);
+}
+
+// starts download of list of followed users
+static void DownloadFollowedUsers(void)
+{
+	WCHAR username[MAX_STRING_LENGTH];
+	if (!GetPrivateProfileStringW(L"twitch", L"username", L"", username, ARRAYSIZE(username), State.IniPath) || username[0] == 0)
+	{
+		WCHAR ImagePath[MAX_PATH];
+		GetTwitchIcon(ImagePath);
+
+		WCHAR Xml[4096];
+		int XmlLength = 0;
+
+		XmlLength = StrCatChainW(Xml, ARRAYSIZE(Xml), XmlLength,
+			L"<toast><visual><binding template=\"ToastGeneric\">"
+			L"<image placement=\"appLogoOverride\" src=\"file:///");
+		XmlLength = StrCatChainW(Xml, ARRAYSIZE(Xml), XmlLength, ImagePath);
+		XmlLength = StrCatChainW(Xml, ARRAYSIZE(Xml), XmlLength, L"\"/>"
+			L"<text>Username not set</text>"
+			L"<text>Cannot download followed users!</text>"
+			L"<text>Edit .ini file to set username?</text>"
+			L"</binding></visual><actions>"
+			L"<action content=\"Yes\" arguments=\"E\"/>"
+			L"<action content=\"No\" arguments=\"N\"/>"
+			L"</actions></toast>");
+
+		WindowsToast_ShowSimple(&State.Toast, Xml, XmlLength, NULL, 0);
+		return;
+	}
+
+	char QueryBytes[1024];
+	wsprintfA(QueryBytes, "{\"query\":\"{user(login:\\\"%S\\\"){follows(first:%u){edges{node{login}}}}}\"}", username, MAX_USER_COUNT);
+
+	// queue gql query to background
+
+	TP_CALLBACK_ENVIRON Environ;
+	InitializeThreadpoolEnvironment(&Environ);
+	SetThreadpoolCallbackPool(&Environ, State.ThreadPool);
+
+	// NOTE: callback must LocalFree() passed context pointer
+	PTP_WORK Work = CreateThreadpoolWork(&DownloadFollowedUsersWork, StrDupA(QueryBytes), &Environ);
+	Assert(Work);
+
+	SubmitThreadpoolWork(Work);
+}
+
 // gql query for getting user game/stream title, happens in background thread
 
 static void DownloadUserStreamCommon(int UserId)
@@ -788,8 +854,13 @@ static void ShowTrayMenu(HWND Window)
 	{
 		AppendMenuW(UsersMenu, MF_GRAYED, 0, L"No users");
 	}
+
+	WCHAR username[MAX_STRING_LENGTH];
+	bool CanDownload = GetPrivateProfileStringW(L"twitch", L"username", L"", username, ARRAYSIZE(username), State.IniPath) && username[0];
+
 	AppendMenuW(UsersMenu, MF_SEPARATOR, 0, NULL);
-	AppendMenuW(UsersMenu, MF_STRING, CMD_EDIT_USERS, L"Edit List");
+	AppendMenuW(UsersMenu, MF_STRING | (CanDownload ? 0 : MF_GRAYED), CMD_DOWNLOAD_USERS, L"Download");
+	AppendMenuW(UsersMenu, MF_STRING, CMD_EDIT_USERS, L"Edit");
 
 	HMENU Menu = CreatePopupMenu();
 	Assert(Menu);
@@ -825,6 +896,10 @@ static void ShowTrayMenu(HWND Window)
 	else if (Command == CMD_EDIT_USERS)
 	{
 		ShellExecuteW(NULL, L"edit", State.IniPath, NULL, NULL, SW_SHOWNORMAL);
+	}
+	else if (Command == CMD_DOWNLOAD_USERS)
+	{
+		DownloadFollowedUsers();
 	}
 	else if (Command == CMD_EXIT)
 	{
@@ -1051,6 +1126,62 @@ static void OnUserInfo(JsonObject* Json)
 	JsonRelease(Data);
 }
 
+static void OnFollowedUsers(JsonObject* Json)
+{
+	JsonArray* Errors = JsonObject_GetArray(Json, JsonCSTR("errors"));
+	if (Errors)
+	{
+		JsonObject* ErrorMessage = JsonArray_GetObject(Errors, 0);
+		HSTRING Message = JsonObject_GetString(ErrorMessage, JsonCSTR("message"));
+		ShowTrayMessage(State.Window, NIIF_ERROR, WindowsGetStringRawBuffer(Message, NULL));
+		WindowsDeleteString(Message);
+		JsonRelease(ErrorMessage);
+		JsonRelease(Errors);
+		return;
+	}
+
+	JsonObject* Data = JsonObject_GetObject(Json, JsonCSTR("data"));
+	JsonObject* User = JsonObject_GetObject(Data, JsonCSTR("user"));
+	JsonObject* Follows = JsonObject_GetObject(User, JsonCSTR("follows"));
+	JsonArray* Edges = JsonObject_GetArray(Follows, JsonCSTR("edges"));
+
+	WCHAR Users[32768];
+	int UsersLength = 0;
+	
+	int Count = JsonArray_GetCount(Edges);
+	for (int Index = 0; Index < Count; Index++)
+	{
+		JsonObject* Edge = JsonArray_GetObject(Edges, Index);
+		JsonObject* Node = JsonObject_GetObject(Edge, JsonCSTR("node"));
+		HSTRING Login = JsonObject_GetString(Node, JsonCSTR("login"));
+		if (Login)
+		{
+			if (Index != 0)
+			{
+				UsersLength = StrCatChainW(Users, ARRAYSIZE(Users), UsersLength, L"\r\n");
+			}
+			UsersLength = StrCatChainW(Users, ARRAYSIZE(Users), UsersLength, WindowsGetStringRawBuffer(Login, NULL));
+		}
+
+		WindowsDeleteString(Login);
+		JsonRelease(Node);
+		JsonRelease(Edge);
+	}
+
+	if (UsersLength)
+	{
+		// delete contents of current "users" section
+		WritePrivateProfileStringW(L"users", NULL, NULL, State.IniPath);
+		// write new "users" section, it will trigger modification notification that will reload .ini file later
+		WritePrivateProfileSectionW(L"users", Users, State.IniPath);
+	}
+
+	JsonRelease(Edges);
+	JsonRelease(Follows);
+	JsonRelease(User);
+	JsonRelease(Data);
+}
+
 static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPARAM LParam)
 {
 	if (Message == WM_CREATE)
@@ -1059,8 +1190,16 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 		State.Quality = GetPrivateProfileIntW(L"player", L"quality", 0, State.IniPath);
 		State.UseMpv = GetPrivateProfileIntW(L"player", L"mpv", 1, State.IniPath);
 
-		// load initial user list
-		LoadUsers();
+		if (GetPrivateProfileIntW(L"twitch", L"autoupdate", 0, State.IniPath) == 0)
+		{
+			// load initial user list
+			LoadUsers();
+		}
+		else
+		{
+			// download followed user list
+			DownloadFollowedUsers();
+		}
 		return 0;
 	}
 	else if (Message == WM_DESTROY)
@@ -1124,6 +1263,14 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 		// initial user info received from gql query
 		JsonObject* Json = (JsonObject*)WParam;
 		OnUserInfo(Json);
+		JsonRelease(Json);
+		return 0;
+	}
+	else if (Message == WM_TWITCH_NOTIFY_FOLLOWED_USERS)
+	{
+		// process list of followed users
+		JsonObject* Json = (JsonObject*)WParam;
+		OnFollowedUsers(Json);
 		JsonRelease(Json);
 		return 0;
 	}
@@ -1292,6 +1439,10 @@ static void OnToastActivated(WindowsToast* Toast, void* Item, LPCWSTR Action)
 	{
 		LPCWSTR Url = Action + 1;
 		ShellExecuteW(NULL, L"open", Url, NULL, NULL, SW_SHOWNORMAL);
+	}
+	else if (Action[0] == L'E')
+	{
+		ShellExecuteW(NULL, L"edit", State.IniPath, NULL, NULL, SW_SHOWNORMAL);
 	}
 }
 

@@ -7,8 +7,14 @@ notifies with Windows 10 toast notifications when they go live.
 
 To add/change monitored Twitch users edit the `TwitchNotify.ini` file next
 to `TwitchNotify.exe` executable. Put users inside `[users]` section each
-in separate line. You don't need to restart application after editing file,
+on separate line. You don't need to restart application after editing file,
 it will be automatically reloaded on change.
+
+Alternative option is to download followed user list from Twitch account. Set
+your Twitch username in `.ini` file. And either set `autoupdate` to 1 to
+download followed list automatically on startup, or explicitly choose
+`Download` option in popup menu. Downloading followed user list will overwrite
+`[users]` section in `.ini` file.
 
 Windows 10 notification toast allows to open Twitch user locally in [mpv][]
 media player, or Twitch page in browser. You can access all monitored users

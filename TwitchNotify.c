@@ -357,7 +357,7 @@ static void WebsocketPing(void)
 	WinHttpWebSocketSend(State.Websocket, WINHTTP_WEB_SOCKET_UTF8_MESSAGE_BUFFER_TYPE, Data, ARRAYSIZE(Data) - 1);
 }
 
-static void WesocketListenUser(int UserId, bool Listen)
+static void WebsocketListenUser(int UserId, bool Listen)
 {
 	if (State.Websocket)
 	{
@@ -635,7 +635,7 @@ static void LoadUsers(void)
 			if (OldUser->UserId > 0)
 			{
 				// unsubscribe from websocket notifications
-				WesocketListenUser(OldUser->UserId, false);
+				WebsocketListenUser(OldUser->UserId, false);
 			}
 			// in case notification game/stream title update was pending
 			// update it and release notification handle
@@ -945,7 +945,7 @@ static void OnWebsocketConnected(HINTERNET Websocket)
 			User* User = &State.Users[Index];
 			if (User->UserId > 0)
 			{
-				WesocketListenUser(User->UserId, true);
+				WebsocketListenUser(User->UserId, true);
 			}
 		}
 	}
@@ -1113,7 +1113,7 @@ static void OnUserInfo(JsonObject* Json)
 			// subscribe to user live events on websocket
 			// if websocket is not connected yet, this subscription will
 			// happen on WM_TWITCH_NOTIFY_WEBSOCKET message
-			WesocketListenUser(User->UserId, true);
+			WebsocketListenUser(User->UserId, true);
 
 			WindowsDeleteString(UserId);
 			WindowsDeleteString(DisplayName);

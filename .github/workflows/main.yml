@@ -1,0 +1,26 @@
+name: 'Main'
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+# This allows a subsequently queued workflow run to interrupt previous runs
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}'
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build Application
+        run: "./build.cmd"
+
+      - uses: ncipollo/release-action@v1
+        with:
+          artifacts: "TwitchNotify.exe"
+          token: ${{ secrets.GITHUB_TOKEN }}

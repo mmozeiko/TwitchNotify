@@ -34,5 +34,5 @@ jobs:
         with:
           artifacts: "TwitchNotify.exe,TwitchNotify.ini"
           token: ${{ secrets.GITHUB_TOKEN }}
-          body: "You need to Download both files in the same Folder. The configuration for the ini file is described in the [Readme.md](Readme.md)"
+          body: "You need to Download both files in the same Folder. The configuration for the ini file is described in the Readme.md](https://github.com/mmozeiko/TwitchNotify/blob/master/README.md)"
   

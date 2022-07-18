@@ -1,6 +1,11 @@
 # Twitch Notify
 
-[![Build](https://github.com/pwnyprod/TwitchNotify/actions/workflows/build.yml/badge.svg)](https://github.com/pwnyprod/TwitchNotify/actions/workflows/build.yml)
+[![Build](https://github.com/mmozeiko/TwitchNotify/actions/workflows/build.yml/badge.svg)](https://github.com/mmozeiko/TwitchNotify/actions/workflows/build.yml)
+[![GitHub license](https://img.shields.io/github/license/mmozeiko/TwitchNotify.svg)](https://github.com/mmozeiko/TwitchNotify/blob/master/LICENSE)
+[![GitHub release](https://img.shields.io/github/release/mmozeiko/TwitchNotify.svg)](https://github.com/mmozeiko/TwitchNotify/releases/)
+[![Github all releases](https://img.shields.io/github/downloads/mmozeiko/TwitchNotify/total.svg)](https://github.com/mmozeiko/TwitchNotify/releases/)
+[![GitHub stars](https://badgen.net/github/stars/mmozeiko/TwitchNotify)](https://github.com/mmozeiko/TwitchNotify/stargazers/)
+
 
 Simple utility that sits in system tray, monitors Twitch users and
 notifies with Windows 10 toast notifications when they go live.
@@ -28,7 +33,7 @@ To use [mpv][] player locally you need to have `mpv.exe` and either [yt-dlp.exe]
 
 # Download
 
-You can get latest build as zip archive here: [TwitchNotify.zip][]
+You can get latest build and config here: [Releases](https://github.com/mmozeiko/TwitchNotify/releases)
 
 # Building
 
@@ -47,5 +52,4 @@ commercial or non-commercial, and by any means.
 [mpv]: https://mpv.io/
 [yt-dlp.exe]: https://github.com/yt-dlp/yt-dlp
 [youtube-dl.exe]: https://youtube-dl.org/
-[TwitchNotify.zip]: https://raw.githubusercontent.com/wiki/mmozeiko/TwitchNotify/TwitchNotify.zip
 [Visual Studio 2022]: https://visualstudio.microsoft.com/vs/

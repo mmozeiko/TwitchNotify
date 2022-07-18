@@ -1,0 +1,38 @@
+name: 'Release'
+
+on:
+  push:
+    tags:
+      - '*.*.*'
+
+jobs:
+  build:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Build Application
+        run: "./build.cmd"
+
+      - uses: actions/upload-artifact@v3
+        with:
+          name: application
+          if-no-files-found: error
+          path: |
+            TwitchNotify.exe
+            TwitchNotify.ini
+
+  release:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/download-artifact@v3
+        with:
+          name: application
+
+      - uses: ncipollo/release-action@v1
+        with:
+          artifacts: "TwitchNotify.exe,TwitchNotify.ini"
+          token: ${{ secrets.GITHUB_TOKEN }}
+          body: "You need to Download both files in the same Folder. The configuration for the ini file is described in the [Readme.md](Readme.md)"
+  

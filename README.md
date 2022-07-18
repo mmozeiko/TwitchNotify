@@ -1,5 +1,7 @@
 # Twitch Notify
 
+[![Build](https://github.com/pwnyprod/TwitchNotify/actions/workflows/build.yml/badge.svg)](https://github.com/pwnyprod/TwitchNotify/actions/workflows/build.yml)
+
 Simple utility that sits in system tray, monitors Twitch users and
 notifies with Windows 10 toast notifications when they go live.
 

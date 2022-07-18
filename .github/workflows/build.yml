@@ -1,10 +1,10 @@
-name: 'Main'
+name: 'Build'
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "master" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "master" ]
 
 # This allows a subsequently queued workflow run to interrupt previous runs
 concurrency:
@@ -20,7 +20,11 @@ jobs:
       - name: Build Application
         run: "./build.cmd"
 
-      - uses: ncipollo/release-action@v1
+      - uses: actions/upload-artifact@v3
         with:
-          artifacts: "TwitchNotify.exe"
-          token: ${{ secrets.GITHUB_TOKEN }}
+          name: application
+          if-no-files-found: error
+          path: |
+            TwitchNotify.exe
+            TwitchNotify.ini
+

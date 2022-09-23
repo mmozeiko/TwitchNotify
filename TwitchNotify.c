@@ -71,8 +71,8 @@
 #define TWITCH_NOTIFY_APPID    L"TwitchNotify.TwitchNotify" // CompanyName.ProductName
 #define TWITCH_NOTIFY_HOMEPAGE L"https://github.com/mmozeiko/TwitchNotify/"
 
-// Twitch oficially documented monitored user count is limited to 50
-#define MAX_USER_COUNT    50
+// Twitch oficially documented monitored user count is limited to 100
+#define MAX_USER_COUNT    100
 
 // just arbitrary limit for strings (most of them will be shorter anyway)
 #define MAX_STRING_LENGTH 256
@@ -589,7 +589,7 @@ static void LoadUsers(void)
 	{
 		if (NewCount == MAX_USER_COUNT)
 		{
-			ShowTrayMessage(State.Window, NIIF_WARNING, L"More than 50 users is not supported");
+			ShowTrayMessage(State.Window, NIIF_WARNING, L"More than 100 users is not supported");
 			break;
 		}
 

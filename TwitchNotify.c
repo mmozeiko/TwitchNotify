@@ -35,6 +35,7 @@
 
 // sent when websocket is connected or disconnected
 // WParam contains HINTERNET handle for websocket, or NULL when disconnected
+// LParam contains true if this is first time websocket connected
 #define WM_TWITCH_NOTIFY_WEBSOCKET (WM_USER + 3)
 
 // sent when websocked receives live status update for user
@@ -53,9 +54,13 @@
 // WParam is JsonObject for response (must release it)
 #define WM_TWITCH_NOTIFY_USER_INFO (WM_USER + 7)
 
+// sent when user stream status is downloaded
+// WParam is JsonObject for response (must release it)
+#define WM_TWITCH_NOTIFY_USER_STREAM_INFO (WM_USER + 8)
+
 // sent when list of followed users is download
 // WParam is JsonObject for response (must release it)
-#define WM_TWITCH_NOTIFY_FOLLOWED_USERS (WM_USER + 8)
+#define WM_TWITCH_NOTIFY_FOLLOWED_USERS (WM_USER + 9)
 
 // command id's for popup menu items
 #define CMD_OPEN_HOMEPAGE  10 // "Twitch Notify" item selected
@@ -414,7 +419,7 @@ static int DoGqlQuery(char* Query, int QuerySize, char* Buffer, int BufferSize)
 	return ReadSize;
 }
 
-// gets "unqiue" path on disk to image - do this by hashing image URL
+// gets "unique" path on disk to image - do this by hashing image URL
 // image will be placed in %TEMP% folder
 
 static void GetImagePath(LPWSTR ImagePath, LPCWSTR ImageUrl)
@@ -866,7 +871,7 @@ static void ShowTrayMenu(HWND Window)
 
 	AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
 
-	AppendMenuW(Menu, MF_STRING | (CanUpdateUsers ? 0 : MF_GRAYED), CMD_DOWNLOAD_USERS, L"Update User List");
+	AppendMenuW(Menu, MF_STRING | (CanUpdateUsers ? 0 : MF_GRAYED), CMD_DOWNLOAD_USERS, L"Download User List");
 	AppendMenuW(Menu, MF_STRING, CMD_EDIT_USERS, L"Edit User List");
 
 	AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
@@ -929,7 +934,21 @@ static void ShowTrayMenu(HWND Window)
 	DestroyMenu(QualityMenu);
 }
 
-static void OnWebsocketConnected(HINTERNET Websocket)
+static void CALLBACK DownloadUserStreamInfoWork(PTP_CALLBACK_INSTANCE Instance, PVOID Context, PTP_WORK Work)
+{
+	char* Query = (char*)Context;
+
+	char Buffer[65536];
+	int BufferSize = DoGqlQuery(Query, lstrlenA(Query), Buffer, sizeof(Buffer));
+	LocalFree(Query);
+
+	JsonObject* Json = JsonObject_Parse(Buffer, BufferSize);
+	PostMessageW(State.Window, WM_TWITCH_NOTIFY_USER_STREAM_INFO, (WPARAM)Json, 0);
+
+	CloseThreadpoolWork(Work);
+}
+
+static void OnWebsocketConnected(HINTERNET Websocket, BOOL FirstConnection)
 {
 	State.Websocket = Websocket;
 	UpdateTrayIcon(State.Window, Websocket ? State.Icon : State.IconDisconnected);
@@ -948,11 +967,59 @@ static void OnWebsocketConnected(HINTERNET Websocket)
 				WebsocketListenUser(User->UserId, true);
 			}
 		}
+
+		// query if users streams are online
+		// don't need to do that on first connection, because that is done as part of .ini file load
+		if (!FirstConnection)
+		{
+			WCHAR Query[4096];
+			int QuerySize = 0;
+
+			QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, L"{\"query\":\"{users(logins:[");
+
+			LPCWSTR Delim = L"";
+
+			for (int Index = 0; Index < State.UserCount; Index++)
+			{
+				User* User = &State.Users[Index];
+
+				QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, Delim);
+				QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, L"\\\"");
+				QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, User->Name);
+				QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, L"\\\"");
+				Delim = L",";
+			}
+
+			QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, L"]){id,stream{viewersCount}}}\"}");
+
+			char QueryBytes[4096];
+			QuerySize = WideCharToMultiByte(CP_UTF8, 0, Query, QuerySize, QueryBytes, ARRAYSIZE(QueryBytes), NULL, NULL);
+			QueryBytes[QuerySize] = 0;
+
+			// queue gql query to background
+
+			TP_CALLBACK_ENVIRON Environ;
+			InitializeThreadpoolEnvironment(&Environ);
+			SetThreadpoolCallbackPool(&Environ, State.ThreadPool);
+
+			// NOTE: callback must LocalFree() passed context pointer
+			PTP_WORK Work = CreateThreadpoolWork(&DownloadUserStreamInfoWork, StrDupA(QueryBytes), &Environ);
+			Assert(Work);
+
+			SubmitThreadpoolWork(Work);
+		}
 	}
 	else
 	{
 		// when websocket is disconnected, stop PING message timer
 		KillTimer(State.Window, TIMER_WEBSOCKET_PING);
+
+		// mark all users offline
+		for (int Index = 0; Index < State.UserCount; Index++)
+		{
+			User* User = &State.Users[Index];
+			User->IsLive = false;
+		}
 	}
 }
 
@@ -1126,6 +1193,69 @@ static void OnUserInfo(JsonObject* Json)
 	JsonRelease(Data);
 }
 
+static void OnUserStreamInfo(JsonObject* Json)
+{
+	JsonArray* Errors = JsonObject_GetArray(Json, JsonCSTR("errors"));
+	if (Errors)
+	{
+		JsonObject* ErrorMessage = JsonArray_GetObject(Errors, 0);
+		HSTRING Message = JsonObject_GetString(ErrorMessage, JsonCSTR("message"));
+		ShowTrayMessage(State.Window, NIIF_ERROR, WindowsGetStringRawBuffer(Message, NULL));
+		WindowsDeleteString(Message);
+		JsonRelease(ErrorMessage);
+		JsonRelease(Errors);
+		return;
+	}
+
+	JsonObject* Data = JsonObject_GetObject(Json, JsonCSTR("data"));
+	JsonArray* Users = JsonObject_GetArray(Data, JsonCSTR("users"));
+
+	int UserIndex = 0;
+	int UsersCount = JsonArray_GetCount(Users);
+	for (int Index = 0; Index < UsersCount; Index++)
+	{
+		JsonObject* UserData = JsonArray_GetObject(Users, Index);
+		if (!UserData)
+		{
+			continue;
+		}
+
+		HSTRING UserIdStr = JsonObject_GetString(UserData, JsonCSTR("id"));
+		int UserId = StrToIntW(WindowsGetStringRawBuffer(UserIdStr, NULL));
+
+		User* User = NULL;
+		for (int UserIndex = 0; UserIndex < State.UserCount; UserIndex++)
+		{
+			if (State.Users[UserIndex].UserId == UserId)
+			{
+				User = &State.Users[UserIndex];
+				break;
+			}
+		}
+
+		if (User)
+		{
+			JsonObject* Stream = JsonObject_GetObject(UserData, JsonCSTR("stream"));
+			if (Stream)
+			{
+				User->ViewerCount = (int)JsonObject_GetNumber(Stream, JsonCSTR("viewersCount"));
+				User->IsLive = Stream != NULL;
+			}
+			else
+			{
+				User->ViewerCount = 0;
+				User->IsLive = false;
+			}
+			JsonRelease(Stream);
+		}
+
+		WindowsDeleteString(UserIdStr);
+		JsonRelease(UserData);
+	}
+	JsonRelease(Users);
+	JsonRelease(Data);
+}
+
 static void OnFollowedUsers(JsonObject* Json)
 {
 	JsonArray* Errors = JsonObject_GetArray(Json, JsonCSTR("errors"));
@@ -1230,7 +1360,8 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 	{
 		// websocket connected or disconnected
 		HINTERNET Websocket = (HINTERNET)WParam;
-		OnWebsocketConnected(Websocket);
+		bool FirstConnection = (bool)LParam;
+		OnWebsocketConnected(Websocket, FirstConnection);
 		return 0;
 	}
 	else if (Message == WM_TWITCH_NOTIFY_USER_STATUS)
@@ -1266,6 +1397,14 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 		JsonRelease(Json);
 		return 0;
 	}
+	else if (Message == WM_TWITCH_NOTIFY_USER_STREAM_INFO)
+	{
+		// user live info received from gql query
+		JsonObject* Json = (JsonObject*)WParam;
+		OnUserStreamInfo(Json);
+		JsonRelease(Json);
+		return 0;
+	}
 	else if (Message == WM_TWITCH_NOTIFY_FOLLOWED_USERS)
 	{
 		// process list of followed users
@@ -1287,6 +1426,23 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 			WebsocketPing();
 			return 0;
 		}
+	}
+	else if (Message == WM_POWERBROADCAST)
+	{
+		// resuming from sleep/hibernate
+		if (WParam == PBT_APMRESUMEAUTOMATIC)
+		{
+			// set all users to be offline
+			for (int Index = 0; Index < State.UserCount; Index++)
+			{
+				State.Users[Index].IsLive = false;
+			}
+
+			// disconnect websocket, it will reconnect automatically
+			WinHttpWebSocketClose(State.Websocket, WINHTTP_WEB_SOCKET_SUCCESS_CLOSE_STATUS, NULL, 0);
+			WinHttpCloseHandle(State.Websocket);
+		}
+		return TRUE;
 	}
 	else if (Message == WM_TASKBARCREATED)
 	{
@@ -1385,6 +1541,7 @@ static DWORD WINAPI WebsocketThread(LPVOID Arg)
 	const int DefaultDelay = 1000;  // 1 second default delay
 	const int MaxDelay = 60 * 1000; // max delay = 1 minute
 	int Delay = DefaultDelay;
+	bool FirstConnection = true;
 	for (;;)
 	{
 		HINTERNET Connection = WinHttpConnect(State.Session, L"pubsub-edge.twitch.tv", INTERNET_DEFAULT_HTTPS_PORT, 0);
@@ -1406,7 +1563,7 @@ static DWORD WINAPI WebsocketThread(LPVOID Arg)
 						Request = NULL;
 						Delay = DefaultDelay;
 
-						PostMessageW(State.Window, WM_TWITCH_NOTIFY_WEBSOCKET, (WPARAM)Websocket, 0);
+						PostMessageW(State.Window, WM_TWITCH_NOTIFY_WEBSOCKET, (WPARAM)Websocket, (LPARAM)FirstConnection);
 						WebsocketLoop(Websocket);
 						PostMessageW(State.Window, WM_TWITCH_NOTIFY_WEBSOCKET, 0, 0);
 
@@ -1425,6 +1582,7 @@ static DWORD WINAPI WebsocketThread(LPVOID Arg)
 
 		Sleep(Delay);
 		Delay = min(Delay * 2, MaxDelay);
+		FirstConnection = false;
 	}
 }
 

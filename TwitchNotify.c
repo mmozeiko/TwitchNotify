@@ -816,6 +816,11 @@ static void DownloadUserStream(int UserId, int Delay)
 
 static void ShowTrayMenu(HWND Window)
 {
+	bool MpvFound = IsMpvInPath();
+	WCHAR username[MAX_STRING_LENGTH];
+
+	bool CanUpdateUsers = GetPrivateProfileStringW(L"twitch", L"username", L"", username, ARRAYSIZE(username), State.IniPath) && username[0];
+
 	HMENU QualityMenu = CreatePopupMenu();
 	Assert(QualityMenu);
 
@@ -825,8 +830,12 @@ static void ShowTrayMenu(HWND Window)
 		AppendMenuW(QualityMenu, Flags, CMD_QUALITY + Index, Quality[Index].Name);
 	}
 
-	HMENU UsersMenu = CreatePopupMenu();
-	Assert(UsersMenu);
+	HMENU Menu = CreatePopupMenu();
+	Assert(Menu);
+
+	AppendMenuW(Menu, MF_STRING, CMD_OPEN_HOMEPAGE, L"Twitch Notify");
+	AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
+
 
 	for (int Index = 0; Index < State.UserCount; Index++)
 	{
@@ -838,40 +847,32 @@ static void ShowTrayMenu(HWND Window)
 			{
 				WCHAR Caption[1024];
 				wsprintfW(Caption, L"%s\t%d", Name, User->ViewerCount);
-				AppendMenuW(UsersMenu, MF_CHECKED, CMD_USER + Index, Caption);
+				AppendMenuW(Menu, MF_CHECKED, CMD_USER + Index, Caption);
 			}
 			else
 			{
-				AppendMenuW(UsersMenu, MF_STRING, CMD_USER + Index, Name);
+				AppendMenuW(Menu, MF_STRING, CMD_USER + Index, Name);
 			}
 		}
 		else // unknown user
 		{
-			AppendMenuW(UsersMenu, MF_GRAYED, 0, User->Name);
+			AppendMenuW(Menu, MF_GRAYED, 0, User->Name);
 		}
 	}
 	if (State.UserCount == 0)
 	{
-		AppendMenuW(UsersMenu, MF_GRAYED, 0, L"No users");
+		AppendMenuW(Menu, MF_GRAYED, 0, L"No users");
 	}
 
-	WCHAR username[MAX_STRING_LENGTH];
-	bool CanDownload = GetPrivateProfileStringW(L"twitch", L"username", L"", username, ARRAYSIZE(username), State.IniPath) && username[0];
-
-	AppendMenuW(UsersMenu, MF_SEPARATOR, 0, NULL);
-	AppendMenuW(UsersMenu, MF_STRING | (CanDownload ? 0 : MF_GRAYED), CMD_DOWNLOAD_USERS, L"Download");
-	AppendMenuW(UsersMenu, MF_STRING, CMD_EDIT_USERS, L"Edit");
-
-	HMENU Menu = CreatePopupMenu();
-	Assert(Menu);
-
-	bool MpvFound = IsMpvInPath();
-
-	AppendMenuW(Menu, MF_STRING, CMD_OPEN_HOMEPAGE, L"Twitch Notify");
 	AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
-	AppendMenuW(Menu, (State.UseMpv ? MF_CHECKED : MF_STRING) | (MpvFound ? 0 : MF_GRAYED), CMD_USE_MPV, L"Use mpv");
-	AppendMenuW(Menu, MF_POPUP | (MpvFound ? 0 : MF_GRAYED), (UINT_PTR)QualityMenu, L"Quality");
-	AppendMenuW(Menu, MF_POPUP, (UINT_PTR)UsersMenu, L"Users");
+
+	AppendMenuW(Menu, MF_STRING | (CanUpdateUsers ? 0 : MF_GRAYED), CMD_DOWNLOAD_USERS, L"Update User List");
+	AppendMenuW(Menu, MF_STRING, CMD_EDIT_USERS, L"Edit User List");
+
+	AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
+
+	AppendMenuW(Menu, (State.UseMpv ? MF_CHECKED : MF_STRING) | (MpvFound ? 0 : MF_GRAYED), CMD_USE_MPV, L"Mpv Playback");
+	AppendMenuW(Menu, MF_POPUP | (MpvFound ? 0 : MF_GRAYED), (UINT_PTR)QualityMenu, L"Mpv Quality");
 
 	AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
 	AppendMenuW(Menu, MF_STRING, CMD_EXIT, L"Exit");
@@ -925,7 +926,6 @@ static void ShowTrayMenu(HWND Window)
 	}
 
 	DestroyMenu(Menu);
-	DestroyMenu(UsersMenu);
 	DestroyMenu(QualityMenu);
 }
 

@@ -17,8 +17,8 @@ if "%VSCMD_ARG_TGT_ARCH%" neq "x64" (
 )
 
 if "%1" equ "debug" (
-  set CL=/MTd /Od /Zi /D_DEBUG /RTC1 /FdTwitchNotify.pdb /fsanitize=address
-  set LINK=/DEBUG libucrtd.lib libvcruntimed.lib
+  set CL=/MDd /Od /Zi /D_DEBUG /RTC1 /FdTwitchNotify.pdb /fsanitize=address
+  set LINK=/DEBUG
 ) else (
   set CL=/O1 /DNDEBUG /GS-
   set LINK=/OPT:REF /OPT:ICF libvcruntime.lib

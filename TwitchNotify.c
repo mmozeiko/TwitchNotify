@@ -1446,7 +1446,11 @@ static void OnToastActivated(WindowsToast* Toast, void* Item, LPCWSTR Action)
 	}
 }
 
+#ifdef _DEBUG
+int wWinMain(HINSTANCE Instance, HINSTANCE PrevInstance, LPWSTR CmdLine, int ShowCmd)
+#else
 void WinMainCRTStartup(void)
+#endif
 {
 	WNDCLASSEXW WindowClass =
 	{

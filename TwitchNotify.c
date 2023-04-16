@@ -876,8 +876,8 @@ static void ShowTrayMenu(HWND Window)
 
 	AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
 
-	AppendMenuW(Menu, (State.UseMpv ? MF_CHECKED : MF_STRING) | (MpvFound ? 0 : MF_GRAYED), CMD_USE_MPV, L"Mpv Playback");
-	AppendMenuW(Menu, MF_POPUP | (MpvFound ? 0 : MF_GRAYED), (UINT_PTR)QualityMenu, L"Mpv Quality");
+	AppendMenuW(Menu, (State.UseMpv ? MF_CHECKED : MF_STRING) | (MpvFound ? 0 : MF_GRAYED), CMD_USE_MPV, L"mpv Playback");
+	AppendMenuW(Menu, MF_POPUP | (MpvFound ? 0 : MF_GRAYED), (UINT_PTR)QualityMenu, L"mpv Quality");
 
 	AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
 	AppendMenuW(Menu, MF_STRING, CMD_EXIT, L"Exit");

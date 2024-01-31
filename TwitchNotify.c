@@ -746,7 +746,7 @@ static void DownloadFollowedUsers(void)
 	}
 
 	char QueryBytes[1024];
-	wsprintfA(QueryBytes, "{\"query\":\"{user(login:\\\"%S\\\"){follows(first:%u){edges{node{login}}}}}\"}", username, MAX_USER_COUNT);
+	wsprintfA(QueryBytes, "{\"query\":\"# query:\\n{user(login:\\\"%S\\\"){follows(first:%u){edges{node{login}}}}}\"}", username, MAX_USER_COUNT);
 
 	// queue gql query to background
 

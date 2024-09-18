@@ -63,13 +63,14 @@
 #define WM_TWITCH_NOTIFY_FOLLOWED_USERS (WM_USER + 9)
 
 // command id's for popup menu items
-#define CMD_OPEN_HOMEPAGE  10 // "Twitch Notify" item selected
-#define CMD_USE_MPV        20 // "Use mpv" checkbox
-#define CMD_QUALITY        30 // +N for Quality submenu items
-#define CMD_EDIT_USERS     40 // "Edit List" in user submenu
-#define CMD_DOWNLOAD_USERS 50 // "Download List" in user submenu
-#define CMD_EXIT           60 // "Exit"
-#define CMD_USER           70 // +N for one of users (indexed into State.Users[] array)
+#define CMD_OPEN_HOMEPAGE     10 // "Twitch Notify" item selected
+#define CMD_USE_MPV           20 // "Use mpv" checkbox
+#define CMD_QUALITY           30 // +N for Quality submenu items
+#define CMD_EDIT_USERS        40 // "Edit List" in user submenu
+#define CMD_DOWNLOAD_USERS    50 // "Download List" in user submenu
+#define CMD_NOTIFY_ON_STARTUP 60 // Check for live users at app startup
+#define CMD_EXIT              70 // "Exit"
+#define CMD_USER              80 // +N for one of users (indexed into State.Users[] array)
 
 #define TWITCH_NOTIFY_NAME     L"Twitch Notify"
 #define TWITCH_NOTIFY_INI      L"TwitchNotify.ini"
@@ -154,6 +155,9 @@ struct
 	// global settings
 	int Quality;
 	bool UseMpv;
+	bool NotifyOnStartup;
+
+	WCHAR ScriptToRunWhenUserIsLive[128];
 
 	// user list
 	User Users[MAX_USER_COUNT];
@@ -277,7 +281,7 @@ static void GetTwitchIcon(LPWSTR ImagePath)
 
 // showing & updating Windows Toast notification
 
-static void ShowUserNotification(User* User)
+static void ShowUserNotificationAndMaybeRunScript(User* User)
 {
 	WCHAR ImagePath[MAX_PATH];
 
@@ -334,6 +338,12 @@ static void ShowUserNotification(User* User)
 	void* Notification = WindowsToast_Create(&State.Toast, Xml, XmlLength, Data, ARRAYSIZE(Data));
 	WindowsToast_Show(&State.Toast, Notification);
 	User->Notification = Notification;
+
+    // Run the user-supplied batch script and pass it the username that just went live.
+    // We're assuming it's a valid file path!
+    if (State.ScriptToRunWhenUserIsLive[0] != 0) {
+        ShellExecuteW(NULL, L"open", State.ScriptToRunWhenUserIsLive, User->Name, NULL, SW_SHOWNORMAL);
+    }
 }
 
 // updates & releases user notification
@@ -669,7 +679,7 @@ static void LoadUsers(void)
 
 			// no notification is shown initially
 			User->Notification = NULL;
-			
+
 			QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, Delim);
 			QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, L"\\\"");
 			QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, NewUsers[NewIndex]);
@@ -681,7 +691,8 @@ static void LoadUsers(void)
 
 	// allowed image widths: 28, 50, 70, 150, 300, 600
 	// use 70 because for 100% dpi scale the toast size is 48 pixels, for 200% it is 96
-	QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, L"]){id,displayName,profileImageURL(width:70),stream{viewersCount}}}\"}");
+	// including game info in the stream query so that we can immediately show notifications for users that are already live when the app is starting.
+	QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, L"]){id,displayName,profileImageURL(width:70),stream{title,viewersCount,game{displayName}}}}\"}");
 
 	char QueryBytes[4096];
 	QuerySize = WideCharToMultiByte(CP_UTF8, 0, Query, QuerySize, QueryBytes, ARRAYSIZE(QueryBytes), NULL, NULL);
@@ -872,7 +883,8 @@ static void ShowTrayMenu(HWND Window)
 	AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
 
 	AppendMenuW(Menu, MF_STRING | (CanUpdateUsers ? 0 : MF_GRAYED), CMD_DOWNLOAD_USERS, L"Download User List");
-	AppendMenuW(Menu, MF_STRING, CMD_EDIT_USERS, L"Edit User List");
+	AppendMenuW(Menu, MF_STRING, CMD_EDIT_USERS, L"Edit Config");
+	AppendMenuW(Menu, (State.NotifyOnStartup ? MF_CHECKED : MF_STRING), CMD_NOTIFY_ON_STARTUP, L"Notify on Startup");
 
 	AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
 
@@ -906,6 +918,10 @@ static void ShowTrayMenu(HWND Window)
 	else if (Command == CMD_DOWNLOAD_USERS)
 	{
 		DownloadFollowedUsers();
+	}
+	else if (Command == CMD_NOTIFY_ON_STARTUP)
+	{
+		State.NotifyOnStartup = !State.NotifyOnStartup;
 	}
 	else if (Command == CMD_EXIT)
 	{
@@ -1052,10 +1068,10 @@ static void OnUserStatus(int UserId, bool IsLive)
 		User->IsLive = true;
 
 		// show initial notification
-		ShowUserNotification(User);
+		ShowUserNotificationAndMaybeRunScript(User);
 
 		// start download of game/stream title
-		DownloadUserStream(UserId, 0);
+		DownloadUserStream(User->UserId, 0);
 	}
 	else
 	{
@@ -1080,6 +1096,35 @@ static void OnUserViewerCount(int UserId, int ViewerCount)
 	User->ViewerCount = ViewerCount;
 }
 
+static void ShowGameInfoFromStream(User* User, JsonObject* Stream)
+{
+	JsonObject* Game = JsonObject_GetObject(Stream, JsonCSTR("game"));
+	HSTRING GameName = JsonObject_GetString(Game, JsonCSTR("displayName"));
+	HSTRING StreamName = JsonObject_GetString(Stream, JsonCSTR("title"));
+
+	if (StreamName)
+	{
+		// if stream name is available in json response
+		// update notification with actual game/stream title
+		LPCWSTR GameNameStr   = WindowsGetStringRawBuffer(GameName, NULL);
+		LPCWSTR StreamNameStr = WindowsGetStringRawBuffer(StreamName, NULL);
+		UpdateUserNotification(User, GameNameStr, StreamNameStr);
+	}
+	else
+	{
+		// cannot get user game/stream title
+		// if notification is still up then retry a bit later - after 1 second
+		if (User->Notification != NULL)
+		{
+			DownloadUserStream(User->UserId, 1000);
+		}
+	}
+
+	WindowsDeleteString(StreamName);
+	WindowsDeleteString(GameName);
+	JsonRelease(Game);
+}
+
 static void OnUserStream(int UserId, JsonObject* Json)
 {
 	User* User = GetUser(UserId);
@@ -1094,31 +1139,9 @@ static void OnUserStream(int UserId, JsonObject* Json)
 	JsonArray* Users = JsonObject_GetArray(Data, JsonCSTR("users"));
 	JsonObject* UserData = JsonArray_GetObject(Users, 0);
 	JsonObject* Stream = JsonObject_GetObject(UserData, JsonCSTR("stream"));
-	JsonObject* Game = JsonObject_GetObject(Stream, JsonCSTR("game"));
-	HSTRING GameName = JsonObject_GetString(Game, JsonCSTR("displayName"));
-	HSTRING StreamName = JsonObject_GetString(Stream, JsonCSTR("title"));
 
-	if (StreamName)
-	{
-		// if stream name is available in json response
-		// update notification with actual game/stream title
-		LPCWSTR GameNameStr = WindowsGetStringRawBuffer(GameName, NULL);
-		LPCWSTR StreamNameStr = WindowsGetStringRawBuffer(StreamName, NULL);
-		UpdateUserNotification(User, GameNameStr, StreamNameStr);
-	}
-	else
-	{
-		// cannot get user game/stream title
-		// if notification is still up then retry a bit later - after 1 second
-		if (User->Notification != NULL)
-		{
-			DownloadUserStream(UserId, 1000);
-		}
-	}
+	ShowGameInfoFromStream(User, Stream);
 
-	WindowsDeleteString(StreamName);
-	WindowsDeleteString(GameName);
-	JsonRelease(Game);
 	JsonRelease(Stream);
 	JsonRelease(UserData);
 	JsonRelease(Users);
@@ -1176,6 +1199,13 @@ static void OnUserInfo(JsonObject* Json)
 			User->ViewerCount = (int)JsonObject_GetNumber(Stream, JsonCSTR("viewersCount"));
 
 			User->IsLive = Stream != NULL;
+
+			if (State.NotifyOnStartup && User->IsLive)
+			{
+				// show initial notification and then update it with game info if available.
+				ShowUserNotificationAndMaybeRunScript(User);
+				ShowGameInfoFromStream(User, Stream);
+			}
 
 			// subscribe to user live events on websocket
 			// if websocket is not connected yet, this subscription will
@@ -1277,7 +1307,7 @@ static void OnFollowedUsers(JsonObject* Json)
 
 	WCHAR Users[32768];
 	int UsersLength = 0;
-	
+
 	int Count = JsonArray_GetCount(Edges);
 	for (int Index = 0; Index < Count; Index++)
 	{
@@ -1320,6 +1350,11 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 		State.Quality = GetPrivateProfileIntW(L"player", L"quality", 0, State.IniPath);
 		State.UseMpv = GetPrivateProfileIntW(L"player", L"mpv", 1, State.IniPath);
 
+		State.NotifyOnStartup = GetPrivateProfileIntW(L"twitch", L"notifyOnStartup", 0, State.IniPath);
+
+        // We could verify that this is a valid file path, but whatever.
+	    GetPrivateProfileStringW(L"twitch", L"scriptToRunWhenUserIsLive", L"", State.ScriptToRunWhenUserIsLive, ARRAYSIZE(State.ScriptToRunWhenUserIsLive), State.IniPath);
+
 		if (GetPrivateProfileIntW(L"twitch", L"autoupdate", 0, State.IniPath) == 0)
 		{
 			// load initial user list
@@ -1334,9 +1369,10 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 	}
 	else if (Message == WM_DESTROY)
 	{
-		WCHAR Str[2] = { L'0' + State.Quality, 0 };
-		WritePrivateProfileStringW(L"player", L"quality", Str, State.IniPath);
+		WCHAR StateStr[2] = { L'0' + State.Quality, 0 };
+		WritePrivateProfileStringW(L"player", L"quality", StateStr, State.IniPath);
 		WritePrivateProfileStringW(L"player", L"mpv", State.UseMpv ? L"1" : L"0", State.IniPath);
+		WritePrivateProfileStringW(L"twitch", L"notifyOnStartup", State.NotifyOnStartup ? L"1" : L"0", State.IniPath);
 		RemoveTrayIcon(Window);
 		if (State.Websocket)
 		{

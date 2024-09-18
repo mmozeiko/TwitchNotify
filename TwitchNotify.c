@@ -157,6 +157,8 @@ struct
 	bool UseMpv;
 	bool NotifyOnStartup;
 
+	WCHAR ScriptToRunWhenUserIsLive[128];
+
 	// user list
 	User Users[MAX_USER_COUNT];
 	int UserCount;
@@ -279,7 +281,7 @@ static void GetTwitchIcon(LPWSTR ImagePath)
 
 // showing & updating Windows Toast notification
 
-static void ShowUserNotification(User* User)
+static void ShowUserNotificationAndMaybeRunScript(User* User)
 {
 	WCHAR ImagePath[MAX_PATH];
 
@@ -336,6 +338,12 @@ static void ShowUserNotification(User* User)
 	void* Notification = WindowsToast_Create(&State.Toast, Xml, XmlLength, Data, ARRAYSIZE(Data));
 	WindowsToast_Show(&State.Toast, Notification);
 	User->Notification = Notification;
+
+    // Run the user-supplied batch script and pass it the username that just went live.
+    // We're assuming it's a valid file path!
+    if (State.ScriptToRunWhenUserIsLive[0] != 0) {
+        ShellExecuteW(NULL, L"open", State.ScriptToRunWhenUserIsLive, User->Name, NULL, SW_SHOWNORMAL);
+    }
 }
 
 // updates & releases user notification
@@ -671,7 +679,7 @@ static void LoadUsers(void)
 
 			// no notification is shown initially
 			User->Notification = NULL;
-			
+
 			QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, Delim);
 			QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, L"\\\"");
 			QuerySize = StrCatChainW(Query, ARRAYSIZE(Query), QuerySize, NewUsers[NewIndex]);
@@ -875,7 +883,7 @@ static void ShowTrayMenu(HWND Window)
 	AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
 
 	AppendMenuW(Menu, MF_STRING | (CanUpdateUsers ? 0 : MF_GRAYED), CMD_DOWNLOAD_USERS, L"Download User List");
-	AppendMenuW(Menu, MF_STRING, CMD_EDIT_USERS, L"Edit User List");
+	AppendMenuW(Menu, MF_STRING, CMD_EDIT_USERS, L"Edit Config");
 	AppendMenuW(Menu, (State.NotifyOnStartup ? MF_CHECKED : MF_STRING), CMD_NOTIFY_ON_STARTUP, L"Notify on Startup");
 
 	AppendMenuW(Menu, MF_SEPARATOR, 0, NULL);
@@ -1060,7 +1068,7 @@ static void OnUserStatus(int UserId, bool IsLive)
 		User->IsLive = true;
 
 		// show initial notification
-		ShowUserNotification(User);
+		ShowUserNotificationAndMaybeRunScript(User);
 
 		// start download of game/stream title
 		DownloadUserStream(User->UserId, 0);
@@ -1098,7 +1106,7 @@ static void ShowGameInfoFromStream(User* User, JsonObject* Stream)
 	{
 		// if stream name is available in json response
 		// update notification with actual game/stream title
-		LPCWSTR GameNameStr = WindowsGetStringRawBuffer(GameName, NULL);
+		LPCWSTR GameNameStr   = WindowsGetStringRawBuffer(GameName, NULL);
 		LPCWSTR StreamNameStr = WindowsGetStringRawBuffer(StreamName, NULL);
 		UpdateUserNotification(User, GameNameStr, StreamNameStr);
 	}
@@ -1195,7 +1203,7 @@ static void OnUserInfo(JsonObject* Json)
 			if (State.NotifyOnStartup && User->IsLive)
 			{
 				// show initial notification and then update it with game info if available.
-				ShowUserNotification(User);
+				ShowUserNotificationAndMaybeRunScript(User);
 				ShowGameInfoFromStream(User, Stream);
 			}
 
@@ -1299,7 +1307,7 @@ static void OnFollowedUsers(JsonObject* Json)
 
 	WCHAR Users[32768];
 	int UsersLength = 0;
-	
+
 	int Count = JsonArray_GetCount(Edges);
 	for (int Index = 0; Index < Count; Index++)
 	{
@@ -1344,6 +1352,9 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 
 		State.NotifyOnStartup = GetPrivateProfileIntW(L"twitch", L"notifyOnStartup", 0, State.IniPath);
 
+        // We could verify that this is a valid file path, but whatever.
+	    GetPrivateProfileStringW(L"twitch", L"scriptToRunWhenUserIsLive", L"", State.ScriptToRunWhenUserIsLive, ARRAYSIZE(State.ScriptToRunWhenUserIsLive), State.IniPath);
+
 		if (GetPrivateProfileIntW(L"twitch", L"autoupdate", 0, State.IniPath) == 0)
 		{
 			// load initial user list
@@ -1358,8 +1369,8 @@ static LRESULT CALLBACK WindowProc(HWND Window, UINT Message, WPARAM WParam, LPA
 	}
 	else if (Message == WM_DESTROY)
 	{
-		WCHAR Str[2] = { L'0' + State.Quality, 0 };
-		WritePrivateProfileStringW(L"player", L"quality", Str, State.IniPath);
+		WCHAR StateStr[2] = { L'0' + State.Quality, 0 };
+		WritePrivateProfileStringW(L"player", L"quality", StateStr, State.IniPath);
 		WritePrivateProfileStringW(L"player", L"mpv", State.UseMpv ? L"1" : L"0", State.IniPath);
 		WritePrivateProfileStringW(L"twitch", L"notifyOnStartup", State.NotifyOnStartup ? L"1" : L"0", State.IniPath);
 		RemoveTrayIcon(Window);

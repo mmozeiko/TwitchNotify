@@ -3,10 +3,15 @@
 #include <windows.h>
 #include <windows.data.json.h>
 
+#include <stdint.h>
+#include <stdbool.h>
+
 // interface
 
 typedef __x_ABI_CWindows_CData_CJson_CIJsonObject JsonObject;
 typedef __x_ABI_CWindows_CData_CJson_CIJsonArray  JsonArray;
+
+typedef __FIIterator_1___FIKeyValuePair_2_HSTRING_Windows__CData__CJson__CIJsonValue JsonIterator;
 
 #define JsonCSTR(Name) (HSTRING)&(JsonHSTRING){ 1, sizeof(Name) - 1, 0, 0, L ## Name }
 #define JsonRelease(Obj) do { if (Obj) IUnknown_Release((IUnknown*)Obj); } while (0)
@@ -22,14 +27,19 @@ static JsonObject* JsonObject_GetObject (JsonObject* Object, HSTRING Name);
 static JsonArray*  JsonObject_GetArray  (JsonObject* Object, HSTRING Name);
 static HSTRING     JsonObject_GetString (JsonObject* Object, HSTRING Name);
 static double      JsonObject_GetNumber (JsonObject* Object, HSTRING Name);
-static boolean     JsonObject_GetBoolean(JsonObject* Object, HSTRING Name);
+static bool        JsonObject_GetBoolean(JsonObject* Object, HSTRING Name);
 
-static UINT32      JsonArray_GetCount  (JsonArray* Array);
+static JsonIterator* JsonObject_GetIterator(JsonObject* Object);
+static HSTRING       JsonIterator_GetKey  (JsonIterator* Iterator);
+static JsonObject*   JsonIterator_GetValue(JsonIterator* Iterator);
+static bool          JsonIterator_Next    (JsonIterator* Iterator);
+
+static uint32_t    JsonArray_GetCount  (JsonArray* Array);
 static JsonObject* JsonArray_GetObject (JsonArray* Array, UINT32 Index);
 static JsonArray*  JsonArray_GetArray  (JsonArray* Array, UINT32 Index);
 static HSTRING     JsonArray_GetString (JsonArray* Array, UINT32 Index);
 static double      JsonArray_GetNumber (JsonArray* Array, UINT32 Index);
-static boolean     JsonArray_GetBoolean(JsonArray* Array, UINT32 Index);
+static bool        JsonArray_GetBoolean(JsonArray* Array, UINT32 Index);
 
 // implementation
 
@@ -51,6 +61,7 @@ typedef struct {
 
 DEFINE_GUID(IID_IJsonObject,        0x2289f159, 0x54de, 0x45d8, 0xab, 0xcc, 0x22, 0x60, 0x3f, 0xa0, 0x66, 0xa0);
 DEFINE_GUID(IID_IVector_IJsonValue, 0xd44662bc, 0xdce3, 0x59a8, 0x92, 0x72, 0x4b, 0x21, 0x0f, 0x33, 0x90, 0x8b);
+DEFINE_GUID(IID_IMap_IJsonValue,    0xdfabb6e1, 0x0411, 0x5a8f, 0xaa, 0x87, 0x35, 0x4e, 0x71, 0x10, 0xf0, 0x99);
 
 JsonObject* JsonObject_Parse(LPCSTR String, int Length)
 {
@@ -77,7 +88,7 @@ JsonObject* JsonObject_ParseW(LPCWSTR String, int Length)
 JsonObject* JsonObject_ParseStr(HSTRING String)
 {
 	__x_ABI_CWindows_CData_CJson_CIJsonObjectStatics* ObjectStatics;
-	HR(RoGetActivationFactory(JsonCSTR("Windows.Data.Json.JsonObject"), &IID_IJsonObject, &ObjectStatics));
+	HR(RoGetActivationFactory(JsonCSTR("Windows.Data.Json.JsonObject"), &IID_IJsonObject, (void**)&ObjectStatics));
 
 	JsonObject* Object;
 	HRESULT hr;
@@ -130,17 +141,82 @@ double JsonObject_GetNumber(JsonObject* Object, HSTRING Name)
 	return Result;
 }
 
-boolean JsonObject_GetBoolean(JsonObject* Object, HSTRING Name)
+bool JsonObject_GetBoolean(JsonObject* Object, HSTRING Name)
 {
 	boolean Result;
 	if (!Object || FAILED(__x_ABI_CWindows_CData_CJson_CIJsonObject_GetNamedBoolean(Object, Name, &Result)))
 	{
 		Result = 0;
 	}
+	return !!Result;
+}
+
+JsonIterator* JsonObject_GetIterator(JsonObject* Object)
+{
+	__FIIterator_1___FIKeyValuePair_2_HSTRING_Windows__CData__CJson__CIJsonValue* Iterator = NULL;
+
+	__FIIterable_1___FIKeyValuePair_2_HSTRING_Windows__CData__CJson__CIJsonValue* Iterable;
+	if (SUCCEEDED(__x_ABI_CWindows_CData_CJson_CIJsonObject_QueryInterface(Object, &IID_IMap_IJsonValue, (void**)&Iterable)))
+	{
+		HR(__FIIterable_1___FIKeyValuePair_2_HSTRING_Windows__CData__CJson__CIJsonValue_First(Iterable, &Iterator));
+
+		boolean HasCurrent;
+		HR(__FIIterator_1___FIKeyValuePair_2_HSTRING_Windows__CData__CJson__CIJsonValue_get_HasCurrent(Iterator, &HasCurrent));
+		if (!HasCurrent)
+		{
+			__FIIterator_1___FIKeyValuePair_2_HSTRING_Windows__CData__CJson__CIJsonValue_Release(Iterator);
+			Iterator = NULL;
+		}
+
+		__FIIterable_1___FIKeyValuePair_2_HSTRING_Windows__CData__CJson__CIJsonValue_Release(Iterable);
+	}
+
+	return Iterator;
+}
+
+HSTRING JsonIterator_GetKey(JsonIterator* Iterator)
+{
+	HSTRING Result = NULL;
+
+	__FIKeyValuePair_2_HSTRING_Windows__CData__CJson__CIJsonValue* Current;
+	if (SUCCEEDED(__FIIterator_1___FIKeyValuePair_2_HSTRING_Windows__CData__CJson__CIJsonValue_get_Current(Iterator, &Current)))
+	{
+		HR(__FIKeyValuePair_2_HSTRING_Windows__CData__CJson__CIJsonValue_get_Key(Current, &Result));
+		__FIKeyValuePair_2_HSTRING_Windows__CData__CJson__CIJsonValue_Release(Current);
+	}
+
 	return Result;
 }
 
-UINT32 JsonArray_GetCount(JsonArray* Array)
+JsonObject* JsonIterator_GetValue(JsonIterator* Iterator)
+{
+	JsonObject* Result = NULL;
+
+	__FIKeyValuePair_2_HSTRING_Windows__CData__CJson__CIJsonValue* Current;
+	if (SUCCEEDED(__FIIterator_1___FIKeyValuePair_2_HSTRING_Windows__CData__CJson__CIJsonValue_get_Current(Iterator, &Current)))
+	{
+		__x_ABI_CWindows_CData_CJson_CIJsonValue* Value;
+		HR(__FIKeyValuePair_2_HSTRING_Windows__CData__CJson__CIJsonValue_get_Value(Current, &Value));
+		__FIKeyValuePair_2_HSTRING_Windows__CData__CJson__CIJsonValue_Release(Current);
+
+		HR(__x_ABI_CWindows_CData_CJson_CIJsonValue_GetObject(Value, &Result));
+		__x_ABI_CWindows_CData_CJson_CIJsonValue_Release(Value);
+	}
+
+	return Result;
+}
+
+bool JsonIterator_Next(JsonIterator* Iterator)
+{
+	boolean Result;
+	if (FAILED(__FIIterator_1___FIKeyValuePair_2_HSTRING_Windows__CData__CJson__CIJsonValue_MoveNext(Iterator, &Result)))
+	{
+		Result = 0;
+	}
+	return !!Result;
+}
+
+uint32_t JsonArray_GetCount(JsonArray* Array)
 {
 	if (!Array)
 	{
@@ -150,7 +226,7 @@ UINT32 JsonArray_GetCount(JsonArray* Array)
 	UINT32 Count;
 	
 	__FIVector_1_Windows__CData__CJson__CIJsonValue* Vector;
-	HR(__x_ABI_CWindows_CData_CJson_CIJsonArray_QueryInterface(Array, &IID_IVector_IJsonValue, &Vector));
+	HR(__x_ABI_CWindows_CData_CJson_CIJsonArray_QueryInterface(Array, &IID_IVector_IJsonValue, (void**)&Vector));
 	if (FAILED(__FIVector_1_Windows__CData__CJson__CIJsonValue_get_Size(Vector, &Count)))
 	{
 		Count = 0;
@@ -200,12 +276,12 @@ double JsonArray_GetNumber(JsonArray* Array, UINT32 Index)
 	return Result;
 }
 
-boolean JsonArray_GetBoolean(JsonArray* Array, UINT32 Index)
+bool JsonArray_GetBoolean(JsonArray* Array, UINT32 Index)
 {
 	boolean Result;
 	if (!Array || FAILED(__x_ABI_CWindows_CData_CJson_CIJsonArray_GetBooleanAt(Array, Index, &Result)))
 	{
-		Result = FALSE;
+		Result = 0;
 	}
-	return Result;
+	return !!Result;
 }
